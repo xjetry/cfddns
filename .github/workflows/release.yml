@@ -1,0 +1,148 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0). Leave empty to build current ref without a GitHub Release."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test ./...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          out="dist/cfddns-${GOOS}-${GOARCH}"
+          go build -trimpath -ldflags="-s -w" -o "$out" ./cmd/cfddns
+          chmod +x "$out"
+          ls -lh "$out"
+          file "$out" || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfddns-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/cfddns-${{ matrix.goos }}-${{ matrix.goarch }}
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    # Tag push, or manual dispatch with an explicit tag input.
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: cfddns-*
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          ls -la
+          sha256sum cfddns-linux-amd64 cfddns-linux-arm64 | tee SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.meta.outputs.tag }}"
+          notes="$(cat <<EOF
+          ## cfddns ${tag}
+
+          Static Linux binaries (\`CGO_ENABLED=0\`).
+
+          ### Download
+
+          | Arch | Asset |
+          |------|--------|
+          | amd64 | \`cfddns-linux-amd64\` |
+          | arm64 | \`cfddns-linux-arm64\` |
+
+          ### Install (example, amd64)
+
+          \`\`\`bash
+          wget -O cfddns "https://github.com/${{ github.repository }}/releases/download/${tag}/cfddns-linux-amd64"
+          chmod +x cfddns
+          sudo ./cfddns -install -4 home.example.com -token "\$CF_TOKEN"
+          \`\`\`
+
+          Verify: \`sha256sum -c SHA256SUMS\`
+          EOF
+          )"
+          # Soft-create: overwrite assets if re-running for same tag.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" \
+              dist/cfddns-linux-amd64 \
+              dist/cfddns-linux-arm64 \
+              dist/SHA256SUMS \
+              --clobber
+          else
+            gh release create "$tag" \
+              dist/cfddns-linux-amd64 \
+              dist/cfddns-linux-arm64 \
+              dist/SHA256SUMS \
+              --title "cfddns ${tag}" \
+              --notes "$notes"
+          fi

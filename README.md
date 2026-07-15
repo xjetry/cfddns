@@ -15,6 +15,26 @@ Supports:
 CGO_ENABLED=0 go build -o cfddns ./cmd/cfddns
 ```
 
+Cross-compile:
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o cfddns-linux-amd64 ./cmd/cfddns
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o cfddns-linux-arm64 ./cmd/cfddns
+```
+
+### CI / Release
+
+GitHub Actions builds **linux/amd64** and **linux/arm64** on every tag `v*`:
+
+- Workflow: `.github/workflows/release.yml`
+- Assets: `cfddns-linux-amd64`, `cfddns-linux-arm64`, `SHA256SUMS`
+
+```bash
+# after first push, cut a release:
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Cloudflare API token
 
 Create a token with at least:
@@ -45,8 +65,10 @@ At least one of `-4` or `-6` is required for run, once, and install. Config merg
 ## Install (wget + systemd)
 
 ```bash
-# Replace the URL with your release binary location.
-wget -O /tmp/cfddns https://example.com/releases/cfddns
+# amd64 (use cfddns-linux-arm64 on arm64 hosts)
+TAG=v0.1.0
+wget -O /tmp/cfddns \
+  "https://github.com/xjetry/cfddns/releases/download/${TAG}/cfddns-linux-amd64"
 chmod +x /tmp/cfddns
 sudo /tmp/cfddns -install \
   -4 home.example.com \
