@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -89,8 +90,71 @@ func (c *Config) ApplyOSEnv() error {
 	return c.ApplyEnvMap(m)
 }
 
+// Usage writes the -h help text (flags, requirements, journalctl examples).
+func Usage(w io.Writer) {
+	fmt.Fprintf(w, `cfddns — Cloudflare DDNS (A/AAAA) for the host public IP
+
+Usage:
+  cfddns [flags]                 run as daemon (period updates)
+  cfddns -once [flags]           run one update cycle and exit
+  cfddns -install [flags]        install binary + /etc/cfddns.env + systemd (root)
+  cfddns -uninstall              remove service, env, and binary (root)
+  cfddns -h                      show this help
+
+Flags:
+  -4 string
+        [optional*] IPv4 FQDN → Cloudflare A record (env CFDDNS_V4)
+  -6 string
+        [optional*] IPv6 FQDN → Cloudflare AAAA record (env CFDDNS_V6)
+  -token string
+        [required]  Cloudflare API Token; Zone:DNS:Edit + Zone:Zone:Read (env CFDDNS_TOKEN)
+  -period duration
+        [optional]  update interval, Go duration (default %s) (env CFDDNS_PERIOD)
+  -port int
+        [optional]  HTTP listen port; omit/0 = no HTTP (env CFDDNS_PORT)
+  -passwd string
+        [required if -port] Bearer secret for HTTP /update (env CFDDNS_PASSWD)
+  -once
+        [optional]  one-shot update then exit (0 if all families ok, else 1)
+  -install
+        [optional]  install to systemd (needs same -4/-6/-token/... as run)
+  -uninstall
+        [optional]  stop and remove unit, env, binary
+  -h, -help
+        show this help
+
+* At least one of -4 or -6 is required for daemon, -once, and -install.
+
+Rules:
+  - Config merge: defaults → %s → process env → CLI flags
+  - Missing IPv4/IPv6 stack for a configured family: soft-fail (log, skip that family);
+    daemon keeps running
+  - -port requires -passwd; -passwd without -port is an error
+  - DNS records are created/updated DNS-only (proxied=false)
+
+HTTP (when -port is set):
+  curl -sS -H "Authorization: Bearer <passwd>" -X POST http://127.0.0.1:<port>/update
+  (GET /update also works)
+
+systemd logs (after -install):
+  journalctl -u cfddns -f
+  journalctl -u cfddns -n 100 --no-pager
+  journalctl -u cfddns --since "1 hour ago"
+
+Examples:
+  cfddns -4 home.example.com -token "$CF_TOKEN"
+  cfddns -4 home.example.com -6 home.example.com -token "$CF_TOKEN" -period 2m
+  sudo cfddns -install -4 home.example.com -token "$CF_TOKEN" -period 5m
+  sudo cfddns -install -4 home.example.com -token "$CF_TOKEN" -port 8080 -passwd secret
+  sudo cfddns -once
+  sudo cfddns -uninstall
+
+`, DefaultPeriod, DefaultEnvPath)
+}
+
 // Load merges defaults, optional /etc/cfddns.env, OS env, then CLI flags.
 // Higher layers win: defaults → env file → OS env → flags.
+// Passing -h/-help returns flag.ErrHelp after printing Usage (caller should exit 0).
 func Load(args []string) (Config, error) {
 	c := Config{Period: DefaultPeriod}
 	// Load env file only when readable. Missing or permission-denied (e.g. root
@@ -107,16 +171,19 @@ func Load(args []string) (Config, error) {
 	}
 
 	fs := flag.NewFlagSet("cfddns", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.Usage = func() { Usage(fs.Output()) }
+
 	var periodStr string
-	fs.StringVar(&c.DomainV4, "4", c.DomainV4, "IPv4 FQDN (A record)")
-	fs.StringVar(&c.DomainV6, "6", c.DomainV6, "IPv6 FQDN (AAAA record)")
-	fs.StringVar(&c.Token, "token", c.Token, "Cloudflare API token")
-	fs.StringVar(&periodStr, "period", c.Period.String(), "update period")
-	fs.IntVar(&c.Port, "port", c.Port, "HTTP port (0=disabled)")
-	fs.StringVar(&c.Passwd, "passwd", c.Passwd, "HTTP Bearer password")
-	fs.BoolVar(&c.Once, "once", false, "run one update and exit")
-	fs.BoolVar(&c.Install, "install", false, "install systemd service")
-	fs.BoolVar(&c.Uninstall, "uninstall", false, "uninstall systemd service")
+	fs.StringVar(&c.DomainV4, "4", c.DomainV4, "[optional*] IPv4 FQDN → A record (env CFDDNS_V4)")
+	fs.StringVar(&c.DomainV6, "6", c.DomainV6, "[optional*] IPv6 FQDN → AAAA record (env CFDDNS_V6)")
+	fs.StringVar(&c.Token, "token", c.Token, "[required] Cloudflare API token (env CFDDNS_TOKEN)")
+	fs.StringVar(&periodStr, "period", c.Period.String(), "[optional] update interval (default 5m, env CFDDNS_PERIOD)")
+	fs.IntVar(&c.Port, "port", c.Port, "[optional] HTTP port; 0=disabled (env CFDDNS_PORT)")
+	fs.StringVar(&c.Passwd, "passwd", c.Passwd, "[required if -port] Bearer secret (env CFDDNS_PASSWD)")
+	fs.BoolVar(&c.Once, "once", false, "[optional] one-shot update then exit")
+	fs.BoolVar(&c.Install, "install", false, "[optional] install systemd service (root)")
+	fs.BoolVar(&c.Uninstall, "uninstall", false, "[optional] uninstall systemd service (root)")
 	if err := fs.Parse(args); err != nil {
 		return c, err
 	}

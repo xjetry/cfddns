@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -24,6 +26,9 @@ func main() {
 
 	cfg, err := config.Load(os.Args[1:])
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
 		log.Fatal(err)
 	}
 	if err := cfg.ModeConflict(); err != nil {

@@ -65,6 +65,20 @@ Uninstall:
 sudo cfddns -uninstall
 ```
 
+### Logs (journalctl)
+
+```bash
+journalctl -u cfddns -f
+journalctl -u cfddns -n 100 --no-pager
+journalctl -u cfddns --since "1 hour ago"
+```
+
+CLI help (same flags + log commands):
+
+```bash
+cfddns -h
+```
+
 ## One-shot update
 
 Useful after install (reads `/etc/cfddns.env`) or for ad-hoc runs:

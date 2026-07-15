@@ -1,8 +1,11 @@
 package config_test
 
 import (
+	"errors"
+	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -141,5 +144,30 @@ func TestLoad_FlagsOverrideDefaults(t *testing.T) {
 	}
 	if c.Period != time.Minute {
 		t.Fatalf("period: got %v want 1m", c.Period)
+	}
+}
+
+func TestUsage_ContainsFlagsAndJournalctl(t *testing.T) {
+	var b strings.Builder
+	config.Usage(&b)
+	out := b.String()
+	for _, want := range []string{
+		"-4", "-6", "-token", "-period", "-port", "-passwd",
+		"-once", "-install", "-uninstall",
+		"journalctl -u cfddns -f",
+		"journalctl -u cfddns -n 100",
+		"[required]",
+		"[optional",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("Usage missing %q", want)
+		}
+	}
+}
+
+func TestLoad_HelpReturnsErrHelp(t *testing.T) {
+	_, err := config.Load([]string{"-h"})
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("got %v, want flag.ErrHelp", err)
 	}
 }
