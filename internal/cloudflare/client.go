@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const defaultBaseURL = "https://api.cloudflare.com/client/v4"
@@ -76,7 +77,8 @@ func (c *Client) httpClient() *http.Client {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
 	}
-	return http.DefaultClient
+	// Bound waits so a hung API call does not hold the updater mutex forever.
+	return &http.Client{Timeout: 30 * time.Second}
 }
 
 // ZoneIDFor lists accessible zones (paginated) and returns the ID of the

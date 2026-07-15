@@ -93,16 +93,14 @@ func (c *Config) ApplyOSEnv() error {
 // Higher layers win: defaults → env file → OS env → flags.
 func Load(args []string) (Config, error) {
 	c := Config{Period: DefaultPeriod}
-	if _, err := os.Stat(DefaultEnvPath); err == nil {
-		m, err := ParseEnvFile(DefaultEnvPath)
-		if err != nil {
-			return c, fmt.Errorf("%s: %w", DefaultEnvPath, err)
-		}
+	// Load env file only when readable. Missing or permission-denied (e.g. root
+	// 0600 while non-root uses CLI flags) is skipped; corrupt content still fails.
+	if m, err := ParseEnvFile(DefaultEnvPath); err == nil {
 		if err := c.ApplyEnvMap(m); err != nil {
 			return c, err
 		}
-	} else if !os.IsNotExist(err) {
-		return c, err
+	} else if err != nil && !os.IsNotExist(err) && !os.IsPermission(err) {
+		return c, fmt.Errorf("%s: %w", DefaultEnvPath, err)
 	}
 	if err := c.ApplyOSEnv(); err != nil {
 		return c, err
