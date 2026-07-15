@@ -68,3 +68,78 @@ func TestLoadEnvFile(t *testing.T) {
 		t.Fatalf("%v", m)
 	}
 }
+
+func TestApplyEnvMap_PeriodAndPort(t *testing.T) {
+	c := config.Config{Period: config.DefaultPeriod}
+	if err := c.ApplyEnvMap(map[string]string{
+		"CFDDNS_PERIOD": "1m",
+		"CFDDNS_PORT":   "8080",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if c.Period != time.Minute {
+		t.Fatalf("period: got %v want 1m", c.Period)
+	}
+	if c.Port != 8080 {
+		t.Fatalf("port: got %d want 8080", c.Port)
+	}
+}
+
+func TestApplyEnvMap_PeriodInvalid(t *testing.T) {
+	c := config.Config{Period: config.DefaultPeriod}
+	if err := c.ApplyEnvMap(map[string]string{"CFDDNS_PERIOD": "not-a-duration"}); err == nil {
+		t.Fatal("expected CFDDNS_PERIOD parse error")
+	}
+}
+
+func TestApplyEnvMap_PortInvalid(t *testing.T) {
+	c := config.Config{}
+	if err := c.ApplyEnvMap(map[string]string{"CFDDNS_PORT": "xyz"}); err == nil {
+		t.Fatal("expected CFDDNS_PORT parse error")
+	}
+}
+
+func TestModeConflict_InstallUninstall(t *testing.T) {
+	c := config.Config{Install: true, Uninstall: true}
+	if err := c.ModeConflict(); err == nil {
+		t.Fatal("expected install+uninstall conflict")
+	}
+}
+
+func TestModeConflict_OnceInstall(t *testing.T) {
+	c := config.Config{Once: true, Install: true}
+	if err := c.ModeConflict(); err == nil {
+		t.Fatal("expected once+install conflict")
+	}
+}
+
+func TestValidate_InvalidDomain(t *testing.T) {
+	c := config.Config{Token: "t", DomainV4: "nodot", Period: time.Minute}
+	if err := c.ValidateRun(); err == nil {
+		t.Fatal("expected invalid domain error")
+	}
+	c.DomainV4 = "has space.example.com"
+	if err := c.ValidateRun(); err == nil {
+		t.Fatal("expected invalid domain error for space")
+	}
+}
+
+func TestLoad_FlagsOverrideDefaults(t *testing.T) {
+	// Avoid inheriting ambient CFDDNS_* from the process environment.
+	for _, k := range []string{"CFDDNS_V4", "CFDDNS_V6", "CFDDNS_TOKEN", "CFDDNS_PERIOD", "CFDDNS_PORT", "CFDDNS_PASSWD"} {
+		t.Setenv(k, "")
+	}
+	c, err := config.Load([]string{"-4", "home.example.com", "-token", "x", "-period", "1m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.DomainV4 != "home.example.com" {
+		t.Fatalf("domain: got %q", c.DomainV4)
+	}
+	if c.Token != "x" {
+		t.Fatalf("token: got %q", c.Token)
+	}
+	if c.Period != time.Minute {
+		t.Fatalf("period: got %v want 1m", c.Period)
+	}
+}

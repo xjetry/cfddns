@@ -94,11 +94,19 @@ func (c *Config) ApplyOSEnv() error {
 func Load(args []string) (Config, error) {
 	c := Config{Period: DefaultPeriod}
 	if _, err := os.Stat(DefaultEnvPath); err == nil {
-		if m, err := ParseEnvFile(DefaultEnvPath); err == nil {
-			_ = c.ApplyEnvMap(m)
+		m, err := ParseEnvFile(DefaultEnvPath)
+		if err != nil {
+			return c, fmt.Errorf("%s: %w", DefaultEnvPath, err)
 		}
+		if err := c.ApplyEnvMap(m); err != nil {
+			return c, err
+		}
+	} else if !os.IsNotExist(err) {
+		return c, err
 	}
-	_ = c.ApplyOSEnv()
+	if err := c.ApplyOSEnv(); err != nil {
+		return c, err
+	}
 
 	fs := flag.NewFlagSet("cfddns", flag.ContinueOnError)
 	var periodStr string
@@ -124,7 +132,7 @@ func Load(args []string) (Config, error) {
 	return c, nil
 }
 
-func lookDomain(s string) bool {
+func validDomain(s string) bool {
 	return s != "" && strings.Contains(s, ".") && !strings.Contains(s, " ")
 }
 
@@ -135,10 +143,10 @@ func (c Config) ValidateRun() error {
 	if c.DomainV4 == "" && c.DomainV6 == "" {
 		return errors.New("at least one of -4 or -6 is required")
 	}
-	if c.DomainV4 != "" && !lookDomain(c.DomainV4) {
+	if c.DomainV4 != "" && !validDomain(c.DomainV4) {
 		return fmt.Errorf("invalid -4 domain: %q", c.DomainV4)
 	}
-	if c.DomainV6 != "" && !lookDomain(c.DomainV6) {
+	if c.DomainV6 != "" && !validDomain(c.DomainV6) {
 		return fmt.Errorf("invalid -6 domain: %q", c.DomainV6)
 	}
 	if c.Period <= 0 {
