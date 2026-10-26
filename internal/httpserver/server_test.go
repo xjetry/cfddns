@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"cfddns/internal/httpserver"
 	"cfddns/internal/updater"
@@ -143,5 +144,63 @@ func TestUpdate_PartialFailure_Still200(t *testing.T) {
 	}
 	if body.Results[1].Action != "error" || body.Results[1].Error != "no route" {
 		t.Fatalf("results[1] = %+v", body.Results[1])
+	}
+}
+
+func TestUpdate_MethodNotAllowed(t *testing.T) {
+	s := &httpserver.Server{Passwd: "secret", Run: func(ctx context.Context) ([]updater.Result, bool) {
+		t.Fatal("Run must not be called for a rejected method")
+		return nil, false
+	}}
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/update", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", resp.StatusCode)
+	}
+}
+
+func TestUpdate_RunGetsDeadline(t *testing.T) {
+	var gotDeadline time.Time
+	var hadDeadline bool
+	s := &httpserver.Server{Passwd: "secret", Run: func(ctx context.Context) ([]updater.Result, bool) {
+		gotDeadline, hadDeadline = ctx.Deadline()
+		return nil, true
+	}}
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/update", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	before := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !hadDeadline {
+		t.Fatal("Run context must carry a deadline")
+	}
+	if d := gotDeadline.Sub(before); d > httpserver.RunTimeout+time.Second || d < httpserver.RunTimeout-10*time.Second {
+		t.Fatalf("deadline %v from request, want about %v", d, httpserver.RunTimeout)
+	}
+}
+
+func TestHTTPServer_TimeoutsSet(t *testing.T) {
+	s := &httpserver.Server{Passwd: "secret"}
+	srv := s.HTTPServer(":0")
+	if srv.Addr != ":0" || srv.Handler == nil {
+		t.Fatalf("server %+v", srv)
+	}
+	if srv.ReadHeaderTimeout <= 0 || srv.ReadTimeout <= 0 || srv.IdleTimeout <= 0 {
+		t.Fatalf("read/idle timeouts must be set: %+v", srv)
+	}
+	if srv.WriteTimeout <= httpserver.RunTimeout {
+		t.Fatalf("WriteTimeout %v must outlast RunTimeout %v", srv.WriteTimeout, httpserver.RunTimeout)
 	}
 }
