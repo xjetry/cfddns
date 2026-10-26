@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"cfddns/internal/cloudflare"
 	"cfddns/internal/ip"
@@ -22,6 +23,10 @@ type Result struct {
 	// Warning reports a condition that did not stop the update, e.g. several
 	// records sharing the name.
 	Warning string `json:"warning,omitempty"`
+	// DetectedAt is when IP detection completed; it is nil if detection did not run.
+	DetectedAt *time.Time `json:"-"`
+	// FinishedAt is when this family's update cycle completed.
+	FinishedAt *time.Time `json:"-"`
 }
 
 const (
@@ -76,6 +81,8 @@ type Updater struct {
 	DomainV6 string
 	IP       IPDetector
 	DNS      DNS
+	// Now supplies result timestamps; nil uses time.Now.
+	Now func() time.Time
 
 	initOnce sync.Once
 	sem      chan struct{}
@@ -87,6 +94,13 @@ func (u *Updater) init() {
 		u.sem = make(chan struct{}, 1)
 		u.cache = make(map[ip.Family]*familyCache)
 	})
+}
+
+func (u *Updater) now() time.Time {
+	if u.Now != nil {
+		return u.Now().UTC()
+	}
+	return time.Now().UTC()
 }
 
 type familySpec struct {
@@ -118,7 +132,10 @@ func (u *Updater) Run(ctx context.Context) (results []Result, allOK bool) {
 	case <-ctx.Done():
 		for _, fs := range u.families() {
 			r := Result{Family: fs.f.String(), Domain: fs.domain}
-			results = append(results, r.fail(fmt.Errorf("waiting for a running update cycle: %w", ctx.Err())))
+			r = r.fail(fmt.Errorf("waiting for a running update cycle: %w", ctx.Err()))
+			finishedAt := u.now()
+			r.FinishedAt = &finishedAt
+			results = append(results, r)
 		}
 		return results, false
 	}
@@ -134,10 +151,16 @@ func (u *Updater) Run(ctx context.Context) (results []Result, allOK bool) {
 	return results, allOK
 }
 
-func (u *Updater) runFamily(ctx context.Context, fs familySpec) Result {
-	res := Result{Family: fs.f.String(), Domain: fs.domain}
+func (u *Updater) runFamily(ctx context.Context, fs familySpec) (res Result) {
+	res = Result{Family: fs.f.String(), Domain: fs.domain}
+	defer func() {
+		finishedAt := u.now()
+		res.FinishedAt = &finishedAt
+	}()
 
 	det, err := u.IP.Detect(ctx, fs.f)
+	detectedAt := u.now()
+	res.DetectedAt = &detectedAt
 	if err != nil {
 		return res.fail(err)
 	}
@@ -161,6 +184,24 @@ func (u *Updater) runFamily(ctx context.Context, fs familySpec) Result {
 		// from scratch instead of reporting an error the resolve may fix.
 	}
 	return u.resolve(ctx, res, fs, det.Addr)
+}
+
+// SelectManagedRecord chooses the lowest-ID record and warns when sibling
+// records with the same type and name will be left unmanaged.
+func SelectManagedRecord(records []cloudflare.Record, typ, name string) (cloudflare.Record, string) {
+	if len(records) == 0 {
+		return cloudflare.Record{}, ""
+	}
+
+	// API order is unspecified; sort by ID so the managed record is the same
+	// one on every recheck instead of drifting between siblings.
+	sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
+	rec := records[0]
+	if len(records) > 1 {
+		return rec, fmt.Sprintf("%d %s records named %s; only %s is managed, the other %d keep their content",
+			len(records), typ, name, rec.ID, len(records)-1)
+	}
+	return rec, ""
 }
 
 // resolve is the uncached path: zone lookup, record lookup, create or patch,
@@ -188,14 +229,8 @@ func (u *Updater) resolve(ctx context.Context, res Result, fs familySpec, addr s
 		return res
 	}
 
-	// API order is unspecified; sort by ID so the managed record is the same
-	// one on every recheck instead of drifting between siblings.
-	sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
-	rec := records[0]
-	if len(records) > 1 {
-		res.Warning = fmt.Sprintf("%d %s records named %s; only %s is managed, the other %d keep their content",
-			len(records), fs.recType, fs.domain, rec.ID, len(records)-1)
-	}
+	rec, warning := SelectManagedRecord(records, fs.recType, fs.domain)
+	res.Warning = warning
 
 	if rec.Content == addr {
 		res.Action = ActionUnchanged
