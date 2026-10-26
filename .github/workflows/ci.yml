@@ -22,24 +22,38 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Test
-        run: go test ./...
+      - name: gofmt
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then
+            echo "files not gofmt-ed:"
+            echo "$out"
+            exit 1
+          fi
 
       - name: Vet
         run: go vet ./...
 
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+
+      - name: Test (race)
+        run: go test -race -count=1 ./...
+
   build:
-    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    name: Build ${{ matrix.asset }}
     needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
+          - { asset: linux-amd64,  goos: linux, goarch: amd64 }
+          - { asset: linux-arm64,  goos: linux, goarch: arm64 }
+          - { asset: linux-armv7,  goos: linux, goarch: arm,    goarm: "7" }
+          - { asset: linux-armv6,  goos: linux, goarch: arm,    goarm: "6" }
+          - { asset: linux-mips,   goos: linux, goarch: mips,   gomips: softfloat }
+          - { asset: linux-mipsle, goos: linux, goarch: mipsle, gomips: softfloat }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,9 +68,11 @@ jobs:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
         run: |
           mkdir -p dist
-          out="dist/cfddns-${GOOS}-${GOARCH}"
+          out="dist/cfddns-${{ matrix.asset }}"
           go build -trimpath -ldflags="-s -w" -o "$out" ./cmd/cfddns
           chmod +x "$out"
           ls -lh "$out"
@@ -64,7 +80,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cfddns-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/cfddns-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: cfddns-${{ matrix.asset }}
+          path: dist/cfddns-${{ matrix.asset }}
           if-no-files-found: error
           retention-days: 14

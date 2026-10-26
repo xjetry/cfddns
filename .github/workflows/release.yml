@@ -27,21 +27,23 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Test
-        run: go test ./...
+      - name: Test (race)
+        run: go test -race -count=1 ./...
 
   build:
-    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    name: Build ${{ matrix.asset }}
     needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
+          - { asset: linux-amd64,  goos: linux, goarch: amd64 }
+          - { asset: linux-arm64,  goos: linux, goarch: arm64 }
+          - { asset: linux-armv7,  goos: linux, goarch: arm,    goarm: "7" }
+          - { asset: linux-armv6,  goos: linux, goarch: arm,    goarm: "6" }
+          - { asset: linux-mips,   goos: linux, goarch: mips,   gomips: softfloat }
+          - { asset: linux-mipsle, goos: linux, goarch: mipsle, gomips: softfloat }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -56,9 +58,11 @@ jobs:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
         run: |
           mkdir -p dist
-          out="dist/cfddns-${GOOS}-${GOARCH}"
+          out="dist/cfddns-${{ matrix.asset }}"
           go build -trimpath -ldflags="-s -w" -o "$out" ./cmd/cfddns
           chmod +x "$out"
           ls -lh "$out"
@@ -67,8 +71,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cfddns-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/cfddns-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: cfddns-${{ matrix.asset }}
+          path: dist/cfddns-${{ matrix.asset }}
           if-no-files-found: error
 
   release:
@@ -101,7 +105,7 @@ jobs:
         working-directory: dist
         run: |
           ls -la
-          sha256sum cfddns-linux-amd64 cfddns-linux-arm64 | tee SHA256SUMS
+          sha256sum cfddns-linux-* | tee SHA256SUMS
 
       - name: Create release
         env:
@@ -111,21 +115,22 @@ jobs:
           notes="$(cat <<EOF
           ## cfddns ${tag}
 
-          Static Linux binaries (\`CGO_ENABLED=0\`).
+          Static Linux binaries (\`CGO_ENABLED=0\`), run on glibc and musl (Alpine, OpenWrt).
 
-          ### Download
+          | Asset | Targets |
+          |-------|---------|
+          | \`cfddns-linux-amd64\` | x86_64 servers, VPS, x86 OpenWrt |
+          | \`cfddns-linux-arm64\` | aarch64: Raspberry Pi 3/4/5 (64-bit OS), ARM VPS, MT7622/MT7981/MT7986/IPQ807x OpenWrt |
+          | \`cfddns-linux-armv7\` | 32-bit ARMv7: Raspberry Pi 2/3 (32-bit OS), IPQ40xx OpenWrt |
+          | \`cfddns-linux-armv6\` | Raspberry Pi 1 / Zero |
+          | \`cfddns-linux-mipsle\` | MT7620/MT7621 (ramips) OpenWrt |
+          | \`cfddns-linux-mips\` | ath79 / big-endian MIPS OpenWrt |
 
-          | Arch | Asset |
-          |------|--------|
-          | amd64 | \`cfddns-linux-amd64\` |
-          | arm64 | \`cfddns-linux-arm64\` |
+          ### Install (auto-detects arch and init system: systemd, OpenRC, procd)
 
-          ### Install (example, amd64)
-
-          \`\`\`bash
-          wget -O cfddns "https://github.com/${{ github.repository }}/releases/download/${tag}/cfddns-linux-amd64"
-          chmod +x cfddns
-          sudo ./cfddns -install -4 home.example.com -token "\$CF_TOKEN"
+          \`\`\`sh
+          wget -qO- https://raw.githubusercontent.com/${{ github.repository }}/${tag}/install.sh \\
+            | sh -s -- -4 home.example.com -token "\$CF_TOKEN"
           \`\`\`
 
           Verify: \`sha256sum -c SHA256SUMS\`
@@ -133,16 +138,9 @@ jobs:
           )"
           # Soft-create: overwrite assets if re-running for same tag.
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" \
-              dist/cfddns-linux-amd64 \
-              dist/cfddns-linux-arm64 \
-              dist/SHA256SUMS \
-              --clobber
+            gh release upload "$tag" dist/cfddns-linux-* dist/SHA256SUMS --clobber
           else
-            gh release create "$tag" \
-              dist/cfddns-linux-amd64 \
-              dist/cfddns-linux-arm64 \
-              dist/SHA256SUMS \
+            gh release create "$tag" dist/cfddns-linux-* dist/SHA256SUMS \
               --title "cfddns ${tag}" \
               --notes "$notes"
           fi
