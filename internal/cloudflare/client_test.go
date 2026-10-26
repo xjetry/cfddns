@@ -103,7 +103,7 @@ func TestZoneIDFor_Paginate(t *testing.T) {
 	}
 }
 
-func TestFindRecord_EmptyVsHit(t *testing.T) {
+func TestFindRecords_EmptyVsHits(t *testing.T) {
 	var hits int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -127,14 +127,8 @@ func TestFindRecord_EmptyVsHit(t *testing.T) {
 		writeJSON(w, map[string]any{
 			"success": true,
 			"result": []map[string]any{
-				{
-					"id":      "rec1",
-					"type":    "A",
-					"name":    "home.example.com",
-					"content": "203.0.113.1",
-					"proxied": false,
-					"ttl":     1,
-				},
+				{"id": "rec1", "type": "A", "name": "home.example.com", "content": "203.0.113.1", "proxied": false, "ttl": 1},
+				{"id": "rec2", "type": "A", "name": "home.example.com", "content": "203.0.113.2", "proxied": true, "ttl": 300},
 			},
 		})
 	}))
@@ -142,24 +136,24 @@ func TestFindRecord_EmptyVsHit(t *testing.T) {
 
 	c := &cloudflare.Client{Token: "t", BaseURL: srv.URL, HTTPClient: srv.Client()}
 
-	rec, err := c.FindRecord(context.Background(), "zid", "A", "home.example.com")
+	recs, err := c.FindRecords(context.Background(), "zid", "A", "home.example.com")
 	if err != nil {
 		t.Fatalf("empty: %v", err)
 	}
-	if rec != nil {
-		t.Fatalf("expected nil record, got %+v", rec)
+	if len(recs) != 0 {
+		t.Fatalf("expected no records, got %+v", recs)
 	}
 
-	rec, err = c.FindRecord(context.Background(), "zid", "A", "home.example.com")
+	recs, err = c.FindRecords(context.Background(), "zid", "A", "home.example.com")
 	if err != nil {
 		t.Fatalf("hit: %v", err)
 	}
-	if rec == nil || rec.ID != "rec1" || rec.Content != "203.0.113.1" {
-		t.Fatalf("got %+v", rec)
+	if len(recs) != 2 || recs[0].ID != "rec1" || recs[0].Content != "203.0.113.1" || recs[1].ID != "rec2" || !recs[1].Proxied {
+		t.Fatalf("got %+v", recs)
 	}
 }
 
-func TestCreateRecord_ForcesProxiedFalseTTL1(t *testing.T) {
+func TestCreateRecord_ForcesDNSOnlyAndReturnsID(t *testing.T) {
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -183,21 +177,18 @@ func TestCreateRecord_ForcesProxiedFalseTTL1(t *testing.T) {
 		}
 		writeJSON(w, map[string]any{
 			"success": true,
-			"result":  map[string]string{"id": "new"},
+			"result":  map[string]any{"id": "new", "type": "A", "name": "home.example.com", "content": "198.51.100.9", "proxied": false, "ttl": 1},
 		})
 	}))
 	t.Cleanup(srv.Close)
 
 	c := &cloudflare.Client{Token: "tok", BaseURL: srv.URL, HTTPClient: srv.Client()}
-	err := c.CreateRecord(context.Background(), "zid", cloudflare.Record{
-		Type:    "A",
-		Name:    "home.example.com",
-		Content: "198.51.100.9",
-		Proxied: true, // must be forced false in request
-		TTL:     300,  // must be forced to 1
-	})
+	rec, err := c.CreateRecord(context.Background(), "zid", "A", "home.example.com", "198.51.100.9")
 	if err != nil {
 		t.Fatalf("CreateRecord: %v", err)
+	}
+	if rec.ID != "new" || rec.Content != "198.51.100.9" {
+		t.Fatalf("returned record %+v", rec)
 	}
 	if gotBody["type"] != "A" || gotBody["name"] != "home.example.com" || gotBody["content"] != "198.51.100.9" {
 		t.Fatalf("body fields: %#v", gotBody)
@@ -212,7 +203,18 @@ func TestCreateRecord_ForcesProxiedFalseTTL1(t *testing.T) {
 	}
 }
 
-func TestUpdateRecord_PUTPathAndBody(t *testing.T) {
+func TestCreateRecord_MissingIDIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"success": true, "result": map[string]any{}})
+	}))
+	t.Cleanup(srv.Close)
+	c := &cloudflare.Client{Token: "tok", BaseURL: srv.URL, HTTPClient: srv.Client()}
+	if _, err := c.CreateRecord(context.Background(), "zid", "A", "home.example.com", "198.51.100.9"); err == nil {
+		t.Fatal("expected error when create returns no id")
+	}
+}
+
+func TestUpdateRecordContent_PATCHOnlyContent(t *testing.T) {
 	var gotMethod, gotPath string
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -230,31 +232,17 @@ func TestUpdateRecord_PUTPathAndBody(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	c := &cloudflare.Client{Token: "tok", BaseURL: srv.URL, HTTPClient: srv.Client()}
-	err := c.UpdateRecord(context.Background(), "zid", "rec1", cloudflare.Record{
-		Type:    "AAAA",
-		Name:    "home.example.com",
-		Content: "2001:db8::1",
-		Proxied: true,
-		TTL:     120,
-	})
-	if err != nil {
-		t.Fatalf("UpdateRecord: %v", err)
+	if err := c.UpdateRecordContent(context.Background(), "zid", "rec1", "2001:db8::1"); err != nil {
+		t.Fatalf("UpdateRecordContent: %v", err)
 	}
-	if gotMethod != http.MethodPut {
-		t.Fatalf("method %s", gotMethod)
+	if gotMethod != http.MethodPatch {
+		t.Fatalf("method %s, want PATCH so dashboard-managed fields survive", gotMethod)
 	}
 	if gotPath != "/zones/zid/dns_records/rec1" {
 		t.Fatalf("path %s", gotPath)
 	}
-	if gotBody["type"] != "AAAA" || gotBody["content"] != "2001:db8::1" {
-		t.Fatalf("body %#v", gotBody)
-	}
-	if gotBody["proxied"] != false {
-		t.Fatalf("proxied=%v", gotBody["proxied"])
-	}
-	ttl, ok := gotBody["ttl"].(float64)
-	if !ok || ttl != 1 {
-		t.Fatalf("ttl=%v", gotBody["ttl"])
+	if len(gotBody) != 1 || gotBody["content"] != "2001:db8::1" {
+		t.Fatalf("body must carry only content: %#v", gotBody)
 	}
 }
 

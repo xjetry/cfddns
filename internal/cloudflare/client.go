@@ -22,7 +22,7 @@ type Client struct {
 	BaseURL    string // default https://api.cloudflare.com/client/v4
 }
 
-// Record is a DNS record used for list/create/update.
+// Record is a DNS record as read from the API.
 type Record struct {
 	ID      string
 	Type    string
@@ -66,6 +66,8 @@ type recordResult struct {
 	TTL     int    `json:"ttl"`
 }
 
+func (r recordResult) record() Record { return Record(r) }
+
 func (c *Client) baseURL() string {
 	if c.BaseURL != "" {
 		return strings.TrimRight(c.BaseURL, "/")
@@ -77,7 +79,7 @@ func (c *Client) httpClient() *http.Client {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
 	}
-	// Bound waits so a hung API call does not hold the updater mutex forever.
+	// Bound waits so a hung API call does not hold the updater lock forever.
 	return &http.Client{Timeout: 30 * time.Second}
 }
 
@@ -130,65 +132,57 @@ func isZoneMatch(fqdn, zone string) bool {
 	return strings.HasSuffix(fqdn, "."+zone)
 }
 
-// FindRecord returns the first DNS record matching type and name, or nil, nil if none.
-func (c *Client) FindRecord(ctx context.Context, zoneID, typ, name string) (*Record, error) {
+// FindRecords returns every DNS record in the zone matching type and name,
+// in API order. An empty slice means the record does not exist.
+func (c *Client) FindRecords(ctx context.Context, zoneID, typ, name string) ([]Record, error) {
 	q := url.Values{}
 	q.Set("type", typ)
 	q.Set("name", name)
+	q.Set("per_page", "100")
 	path := fmt.Sprintf("/zones/%s/dns_records?%s", url.PathEscape(zoneID), q.Encode())
 
-	var records []recordResult
-	if _, err := c.do(ctx, http.MethodGet, path, nil, &records); err != nil {
+	var results []recordResult
+	if _, err := c.do(ctx, http.MethodGet, path, nil, &results); err != nil {
 		return nil, err
 	}
-	if len(records) == 0 {
-		return nil, nil
+	records := make([]Record, 0, len(results))
+	for _, r := range results {
+		records = append(records, r.record())
 	}
-	r := records[0]
-	return &Record{
-		ID:      r.ID,
-		Type:    r.Type,
-		Name:    r.Name,
-		Content: r.Content,
-		Proxied: r.Proxied,
-		TTL:     r.TTL,
-	}, nil
+	return records, nil
 }
 
-// CreateRecord creates a DNS record. proxied is forced to false and ttl to 1 (automatic).
-func (c *Client) CreateRecord(ctx context.Context, zoneID string, rec Record) error {
-	body := recordBody{
-		Type:    rec.Type,
-		Name:    rec.Name,
-		Content: rec.Content,
-		Proxied: false,
-		TTL:     1,
-	}
+// CreateRecord creates a DNS-only record (proxied=false, ttl=1 automatic) and
+// returns it with the ID assigned by Cloudflare.
+func (c *Client) CreateRecord(ctx context.Context, zoneID, typ, name, content string) (Record, error) {
+	body := struct {
+		Type    string `json:"type"`
+		Name    string `json:"name"`
+		Content string `json:"content"`
+		Proxied bool   `json:"proxied"`
+		TTL     int    `json:"ttl"`
+	}{Type: typ, Name: name, Content: content, Proxied: false, TTL: 1}
 	path := fmt.Sprintf("/zones/%s/dns_records", url.PathEscape(zoneID))
-	_, err := c.do(ctx, http.MethodPost, path, body, nil)
-	return err
-}
-
-// UpdateRecord replaces a DNS record. proxied is forced to false and ttl to 1 (automatic).
-func (c *Client) UpdateRecord(ctx context.Context, zoneID, recordID string, rec Record) error {
-	body := recordBody{
-		Type:    rec.Type,
-		Name:    rec.Name,
-		Content: rec.Content,
-		Proxied: false,
-		TTL:     1,
+	var created recordResult
+	if _, err := c.do(ctx, http.MethodPost, path, body, &created); err != nil {
+		return Record{}, err
 	}
-	path := fmt.Sprintf("/zones/%s/dns_records/%s", url.PathEscape(zoneID), url.PathEscape(recordID))
-	_, err := c.do(ctx, http.MethodPut, path, body, nil)
-	return err
+	if created.ID == "" {
+		return Record{}, fmt.Errorf("cloudflare api: create returned no record id")
+	}
+	return created.record(), nil
 }
 
-type recordBody struct {
-	Type    string `json:"type"`
-	Name    string `json:"name"`
-	Content string `json:"content"`
-	Proxied bool   `json:"proxied"`
-	TTL     int    `json:"ttl"`
+// UpdateRecordContent changes only the content of an existing record. PATCH
+// (not PUT) is used so fields managed in the dashboard — proxied, ttl,
+// comment, tags — are left exactly as the operator set them.
+func (c *Client) UpdateRecordContent(ctx context.Context, zoneID, recordID, content string) error {
+	body := struct {
+		Content string `json:"content"`
+	}{Content: content}
+	path := fmt.Sprintf("/zones/%s/dns_records/%s", url.PathEscape(zoneID), url.PathEscape(recordID))
+	_, err := c.do(ctx, http.MethodPatch, path, body, nil)
+	return err
 }
 
 // do performs an authenticated API request and decodes result into dest when non-nil.

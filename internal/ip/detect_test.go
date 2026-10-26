@@ -2,9 +2,12 @@ package ip_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -34,51 +37,176 @@ func TestParseTraceIP_IPv6(t *testing.T) {
 	}
 }
 
-func TestDetector_Detect_ClientFor(t *testing.T) {
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+// traceServer serves a trace body and returns a ClientFor that redirects the
+// hard-coded Cloudflare URL to it.
+func traceServer(t *testing.T, body string) func(ip.Family) *http.Client {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/cdn-cgi/trace" {
 			http.NotFound(w, r)
 			return
 		}
-		_, _ = w.Write([]byte("fl=xxx\nip=198.51.100.42\nts=1.0\n"))
+		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(srv.Close)
-
 	target, err := url.Parse(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return func(ip.Family) *http.Client {
+		return &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				req2 := req.Clone(req.Context())
+				req2.URL.Scheme = target.Scheme
+				req2.URL.Host = target.Host
+				req2.Host = target.Host
+				return http.DefaultTransport.RoundTrip(req2)
+			}),
+		}
+	}
+}
 
+func TestDetector_Detect_Trace(t *testing.T) {
+	clientFor := traceServer(t, "fl=xxx\nip=198.51.100.42\nts=1.0\n")
 	d := &ip.Detector{
 		ClientFor: func(f ip.Family) *http.Client {
 			if f != ip.IPv4 {
 				t.Errorf("expected IPv4, got %v", f)
 			}
-			return &http.Client{
-				Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-					req2 := req.Clone(req.Context())
-					req2.URL.Scheme = target.Scheme
-					req2.URL.Host = target.Host
-					req2.Host = target.Host
-					return http.DefaultTransport.RoundTrip(req2)
-				}),
-			}
+			return clientFor(f)
 		},
 	}
-
 	got, err := d.Detect(context.Background(), ip.IPv4)
 	if err != nil {
 		t.Fatalf("Detect: %v", err)
 	}
-	if got != "198.51.100.42" {
-		t.Fatalf("got %q", got)
+	if got.Addr != "198.51.100.42" || got.Source != "trace" {
+		t.Fatalf("got %+v", got)
 	}
 }
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
+func TestDetector_Detect_TraceErrors(t *testing.T) {
+	d := &ip.Detector{ClientFor: traceServer(t, "fl=xxx\nts=1.0\n")}
+	if _, err := d.Detect(context.Background(), ip.IPv4); err == nil {
+		t.Fatal("expected error for body without ip=")
+	}
+	d = &ip.Detector{ClientFor: func(ip.Family) *http.Client {
+		return &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("no route to host")
+		})}
+	}}
+	_, err := d.Detect(context.Background(), ip.IPv6)
+	if err == nil || !strings.Contains(err.Error(), "no route to host") {
+		t.Fatalf("err = %v", err)
+	}
+}
 
-func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req)
+const ifInet6Fixture = `fe800000000000000242acfffe110002 02 40 20 80     eth0
+20010db8000000000000000000000002 02 40 00 00     eth0
+20010db8000000000000000000000001 02 40 00 00     eth0
+20010db80000000000001234abcd0001 02 40 00 01     eth0
+20010db8000000000000000000000099 02 40 00 20     eth0
+fd000000000000000000000000000001 02 40 00 00     eth0
+20010db8000000000000000000000055 03 40 00 00     wlan0
+00000000000000000000000000000001 01 80 10 80       lo
+`
+
+func writeFixture(t *testing.T, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "if_inet6")
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestStableIPv6_SkipsTemporaryDeprecatedLinkLocalULA(t *testing.T) {
+	got, err := ip.StableIPv6(writeFixture(t, ifInet6Fixture), "eth0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ::1 and ::2 are both stable; lowest address wins for determinism.
+	if got != "2001:db8::1" {
+		t.Fatalf("got %q want 2001:db8::1", got)
+	}
+}
+
+func TestStableIPv6_PrefersPermanent(t *testing.T) {
+	fixture := `20010db8000000000000000000000001 02 40 00 00     eth0
+20010db8000000000000000000000009 02 40 00 80     eth0
+`
+	got, err := ip.StableIPv6(writeFixture(t, fixture), "eth0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "2001:db8::9" {
+		t.Fatalf("got %q want permanent 2001:db8::9", got)
+	}
+}
+
+func TestStableIPv6_Errors(t *testing.T) {
+	p := writeFixture(t, ifInet6Fixture)
+	if _, err := ip.StableIPv6(p, "eth9"); err == nil || !strings.Contains(err.Error(), "no IPv6 addresses") {
+		t.Errorf("unknown iface: err=%v", err)
+	}
+	onlyTemp := "20010db80000000000001234abcd0001 02 40 00 01     eth0\n"
+	if _, err := ip.StableIPv6(writeFixture(t, onlyTemp), "eth0"); err == nil || !strings.Contains(err.Error(), "no stable") {
+		t.Errorf("only temporary: err=%v", err)
+	}
+	if _, err := ip.StableIPv6(filepath.Join(t.TempDir(), "missing"), "eth0"); err == nil {
+		t.Error("missing table: expected error")
+	}
+	if _, err := ip.StableIPv6(writeFixture(t, "garbage line\n"), "eth0"); err == nil {
+		t.Error("garbage: expected error")
+	}
+}
+
+func TestDetector_V6Iface_UsesInterfaceWithoutNetwork(t *testing.T) {
+	d := &ip.Detector{
+		V6Iface:     "eth0",
+		ProcIfInet6: writeFixture(t, ifInet6Fixture),
+		ClientFor: func(ip.Family) *http.Client {
+			t.Fatal("trace must not be used when the interface has a stable address")
+			return nil
+		},
+	}
+	got, err := d.Detect(context.Background(), ip.IPv6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Addr != "2001:db8::1" || got.Source != "iface:eth0" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestDetector_V6Iface_FallsBackToTrace(t *testing.T) {
+	d := &ip.Detector{
+		V6Iface:     "eth9",
+		ProcIfInet6: writeFixture(t, ifInet6Fixture),
+		ClientFor:   traceServer(t, "ip=2001:db8:ffff::7\n"),
+	}
+	got, err := d.Detect(context.Background(), ip.IPv6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Addr != "2001:db8:ffff::7" {
+		t.Fatalf("addr %q", got.Addr)
+	}
+	if !strings.HasPrefix(got.Source, "trace (fallback, iface eth9:") {
+		t.Fatalf("source %q", got.Source)
+	}
+	// IPv4 never consults the interface table.
+	d4 := &ip.Detector{V6Iface: "eth0", ProcIfInet6: writeFixture(t, ifInet6Fixture), ClientFor: traceServer(t, "ip=203.0.113.9\n")}
+	got, err = d4.Detect(context.Background(), ip.IPv4)
+	if err != nil || got.Addr != "203.0.113.9" || got.Source != "trace" {
+		t.Fatalf("v4: %+v %v", got, err)
+	}
 }
 
 func TestFamily_String(t *testing.T) {
