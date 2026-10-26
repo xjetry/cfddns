@@ -31,3 +31,13 @@ func TestClient_ReusedPerFamily(t *testing.T) {
 		}
 	}
 }
+
+func TestCloseIdleConnections_BeforeAndAfterUse(t *testing.T) {
+	d := &Detector{}
+	d.CloseIdleConnections() // no clients yet
+	_ = d.client(IPv4)
+	d.CloseIdleConnections()
+	if d.client(IPv4) == nil {
+		t.Fatal("client must survive CloseIdleConnections")
+	}
+}

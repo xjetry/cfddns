@@ -266,3 +266,23 @@ func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+func TestDefaultClient_HTTP1OnlyAndCloseIdle(t *testing.T) {
+	c := &cloudflare.Client{Token: "t"}
+	c.CloseIdleConnections() // before first use: no transport yet, must not panic
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor != 1 {
+			t.Errorf("proto %s, want HTTP/1.x", r.Proto)
+		}
+		writeJSON(w, map[string]any{"success": true, "result": []any{}})
+	}))
+	t.Cleanup(srv.Close)
+	c.BaseURL = srv.URL
+	if _, err := c.FindRecords(context.Background(), "zid", "A", "home.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	c.CloseIdleConnections()
+	if _, err := c.FindRecords(context.Background(), "zid", "A", "home.example.com"); err != nil {
+		t.Fatalf("client must keep working after CloseIdleConnections: %v", err)
+	}
+}

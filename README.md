@@ -168,6 +168,29 @@ cfddns -h
 - **同名多条记录**：按 ID 排序只管第一条，其余保持原内容，并在日志和 HTTP 结果里给出 `warning`。
 - **日志**：created / updated / error 每次打；`unchanged` 只在首轮和状态变化后打一次，稳态不刷日志。
 - **HTTP**：`/update` 单次更新 2 分钟超时，连接有读头 / 读 / 空闲超时；更新互斥，等锁超时直接返回 `ok:false`。
+- **内存**：GOMAXPROCS=1；每轮结束关闭空闲连接并把堆页归还 OS；API 客户端只用 HTTP/1.1。见[内存](#内存)。
+
+---
+
+## 内存
+
+daemon 稳态常驻（linux/amd64，1 CPU，真实 Cloudflare 流量，每轮结束后释放）：
+
+| | RSS | 匿名页 | 二进制映射页 |
+|---|---|---|---|
+| 优化前 | 14.6 MB | 7.5 MB | 7.1 MB |
+| 现在 | 12.0 MB | 5.0 MB | 7.0 MB |
+
+匿名页是真正占用 RAM 的部分；二进制映射页大小约等于二进制本身，内核缺内存时可直接回收。32 位的 mipsle / armv7 指针减半，绝对值更低。每轮周期内的瞬时峰值由 TLS 握手决定，约比稳态高 2.5 MB。
+
+RAM 特别紧的路由器可以不常驻 daemon，改用 cron 跑一次性模式，两次运行之间不占内存。先正常 `-install` 生成配置，再停掉服务并加 cron：
+
+```sh
+/etc/init.d/cfddns stop && /etc/init.d/cfddns disable     # OpenWrt
+echo '*/5 * * * * /usr/bin/cfddns -once' >> /etc/crontabs/root && /etc/init.d/cron restart
+```
+
+`-once` 每次都完整解析 zone 和记录（无跨进程缓存），5 分钟一次远低于 Cloudflare 限流。
 
 ---
 

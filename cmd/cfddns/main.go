@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"syscall"
@@ -24,6 +26,10 @@ import (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 	log.SetPrefix("cfddns ")
+	// One P is enough: a cycle is a handful of sequential HTTPS calls, and
+	// every extra P costs its own allocation cache, GC worker and OS thread,
+	// which on a multi-core router is memory spent on parallelism never used.
+	runtime.GOMAXPROCS(1)
 
 	cfg, err := config.Load(os.Args[1:])
 	if err != nil {
@@ -76,11 +82,13 @@ func main() {
 		log.Fatal(err)
 	}
 
+	det := &ip.Detector{V6Iface: cfg.V6Iface}
+	dns := &cloudflare.Client{Token: cfg.Token}
 	up := &updater.Updater{
 		DomainV4: cfg.DomainV4,
 		DomainV6: cfg.DomainV6,
-		IP:       &ip.Detector{V6Iface: cfg.V6Iface},
-		DNS:      &cloudflare.Client{Token: cfg.Token},
+		IP:       det,
+		DNS:      dns,
 	}
 	rep := newReporter(log.Printf)
 	runOnce := func(ctx context.Context) ([]updater.Result, bool) {
@@ -97,17 +105,30 @@ func main() {
 		return
 	}
 
+	// Between cycles the daemon only waits, so everything a cycle allocated
+	// (TLS handshakes, JSON, pooled connections) is garbage until the next
+	// period. Dropping the connections and returning freed heap pages to the
+	// OS right away keeps the resident size at the idle minimum on routers
+	// and other small hosts instead of waiting for the lazy scavenger.
+	runCycle := func(ctx context.Context) ([]updater.Result, bool) {
+		results, ok := runOnce(ctx)
+		det.CloseIdleConnections()
+		dns.CloseIdleConnections()
+		debug.FreeOSMemory()
+		return results, ok
+	}
+
 	// The signal context exists before the first cycle so a SIGTERM during
 	// it cancels the in-flight requests instead of killing the process.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	// Daemon: first cycle logs errors but never exits solely for IP/DNS failures.
-	runOnce(ctx)
+	runCycle(ctx)
 
 	var wg sync.WaitGroup
 	if cfg.Port > 0 {
-		srv := &httpserver.Server{Passwd: cfg.Passwd, Run: runOnce}
+		srv := &httpserver.Server{Passwd: cfg.Passwd, Run: runCycle}
 		httpSrv := srv.HTTPServer(":" + strconv.Itoa(cfg.Port))
 		wg.Add(2)
 		go func() {
@@ -136,7 +157,7 @@ func main() {
 			wg.Wait()
 			return
 		case <-t.C:
-			runOnce(ctx)
+			runCycle(ctx)
 		}
 	}
 }

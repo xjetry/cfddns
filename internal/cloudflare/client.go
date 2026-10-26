@@ -3,6 +3,7 @@ package cloudflare
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,6 +22,10 @@ type Client struct {
 	Token      string
 	HTTPClient *http.Client
 	BaseURL    string // default https://api.cloudflare.com/client/v4
+
+	once      sync.Once
+	transport *http.Transport
+	client    *http.Client
 }
 
 // Record is a DNS record as read from the API.
@@ -75,12 +81,37 @@ func (c *Client) baseURL() string {
 	return defaultBaseURL
 }
 
+// httpClient returns the client built once for this Client. It is not the
+// default transport: HTTP/2 is disabled because an h2 connection carries
+// 64 KB framer and HPACK buffers that a few small JSON calls per hour never
+// need, and the idle pool is kept to the one or two connections a cycle can
+// use so nothing lingers on hosts with little memory.
 func (c *Client) httpClient() *http.Client {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
 	}
-	// Bound waits so a hung API call does not hold the updater lock forever.
-	return &http.Client{Timeout: 30 * time.Second}
+	c.once.Do(func() {
+		c.transport = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			// A non-nil TLSNextProto map tells the transport the caller
+			// configured protocols, so it does not register h2 itself.
+			TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{},
+			MaxIdleConns:        2,
+			IdleConnTimeout:     30 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
+		}
+		// Bound waits so a hung API call does not hold the updater lock forever.
+		c.client = &http.Client{Timeout: 30 * time.Second, Transport: c.transport}
+	})
+	return c.client
+}
+
+// CloseIdleConnections drops pooled API connections; the daemon calls it
+// after every cycle so a connection never idles across a period.
+func (c *Client) CloseIdleConnections() {
+	if c.transport != nil {
+		c.transport.CloseIdleConnections()
+	}
 }
 
 // ZoneIDFor lists accessible zones (paginated) and returns the ID of the

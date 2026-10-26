@@ -83,6 +83,21 @@ func (d *Detector) client(f Family) *http.Client {
 	return d.clients[f]
 }
 
+// CloseIdleConnections drops the keep-alive connections of both family
+// clients. A connection kept across a period would hit IdleConnTimeout
+// before the next cycle anyway; closing it right after the cycle frees its
+// TLS buffers and reader goroutines immediately on hosts with little memory.
+func (d *Detector) CloseIdleConnections() {
+	for _, c := range d.clients {
+		if c == nil {
+			continue
+		}
+		if tr, ok := c.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+	}
+}
+
 func (d *Detector) timeout() time.Duration {
 	if d.Timeout > 0 {
 		return d.Timeout
