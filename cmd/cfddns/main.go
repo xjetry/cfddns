@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -37,23 +38,37 @@ func main() {
 
 	switch {
 	case cfg.Uninstall:
-		if err := install.Uninstall(); err != nil {
+		sys, err := install.Select(cfg.Init, install.HostProbe())
+		if err != nil {
 			log.Fatal(err)
 		}
-		log.Println("uninstalled")
+		if err := install.RequireRoot("uninstall"); err != nil {
+			log.Fatal(err)
+		}
+		if err := install.Uninstall(sys, install.Exec); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("uninstalled (%s)", sys.Name)
 		return
 	case cfg.Install:
 		if err := cfg.ValidateInstall(); err != nil {
+			log.Fatal(err)
+		}
+		sys, err := install.Select(cfg.Init, install.HostProbe())
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := install.RequireRoot("install"); err != nil {
 			log.Fatal(err)
 		}
 		self, err := os.Executable()
 		if err != nil {
 			log.Fatal(err)
 		}
-		if err := install.Install(cfg, self); err != nil {
+		if err := install.Install(sys, cfg, self, install.Exec); err != nil {
 			log.Fatal(err)
 		}
-		log.Println("installed and started")
+		log.Printf("installed and started (%s); logs: %s", sys.Name, sys.LogHint)
 		return
 	}
 
@@ -64,19 +79,13 @@ func main() {
 	up := &updater.Updater{
 		DomainV4: cfg.DomainV4,
 		DomainV6: cfg.DomainV6,
-		IP:       &ip.Detector{},
+		IP:       &ip.Detector{V6Iface: cfg.V6Iface},
 		DNS:      &cloudflare.Client{Token: cfg.Token},
 	}
-
+	rep := newReporter(log.Printf)
 	runOnce := func(ctx context.Context) ([]updater.Result, bool) {
 		results, ok := up.Run(ctx)
-		for _, r := range results {
-			if r.Error != "" {
-				log.Printf("%s %s %s: %s", r.Family, r.Domain, r.Action, r.Error)
-			} else {
-				log.Printf("%s %s %s ip=%s", r.Family, r.Domain, r.Action, r.IP)
-			}
-		}
+		rep.report(results)
 		return results, ok
 	}
 
@@ -88,23 +97,29 @@ func main() {
 		return
 	}
 
-	// Daemon: first cycle logs errors but never exits solely for IP/DNS failures.
-	runOnce(context.Background())
-
+	// The signal context exists before the first cycle so a SIGTERM during
+	// it cancels the in-flight requests instead of killing the process.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Daemon: first cycle logs errors but never exits solely for IP/DNS failures.
+	runOnce(ctx)
+
+	var wg sync.WaitGroup
 	if cfg.Port > 0 {
 		srv := &httpserver.Server{Passwd: cfg.Passwd, Run: runOnce}
-		httpSrv := &http.Server{Addr: ":" + strconv.Itoa(cfg.Port), Handler: srv.Handler()}
+		httpSrv := srv.HTTPServer(":" + strconv.Itoa(cfg.Port))
+		wg.Add(2)
 		go func() {
+			defer wg.Done()
 			log.Printf("http listening on :%d", cfg.Port)
-			if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				// Keep the DDNS ticker running even if the HTTP port is unavailable.
 				log.Printf("http server error: %v", err)
 			}
 		}()
 		go func() {
+			defer wg.Done()
 			<-ctx.Done()
 			shctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
@@ -118,6 +133,7 @@ func main() {
 		select {
 		case <-ctx.Done():
 			log.Println("shutdown")
+			wg.Wait()
 			return
 		case <-t.C:
 			runOnce(ctx)
