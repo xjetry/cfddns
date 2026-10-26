@@ -12,6 +12,22 @@ import (
 	"cfddns/internal/config"
 )
 
+func clearEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{"CFDDNS_V4", "CFDDNS_V6", "CFDDNS_V6_IFACE", "CFDDNS_TOKEN", "CFDDNS_PERIOD", "CFDDNS_PORT", "CFDDNS_PASSWD"} {
+		t.Setenv(k, "")
+	}
+}
+
+func writeEnv(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "cfddns.env")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func TestValidate_RequiresTokenAndAtLeastOneDomain(t *testing.T) {
 	c := config.Config{Period: 5 * time.Minute}
 	if err := c.ValidateRun(); err == nil {
@@ -49,20 +65,77 @@ func TestValidate_PasswdWithoutPort(t *testing.T) {
 	}
 }
 
-func TestValidate_PeriodPositive(t *testing.T) {
-	c := config.Config{Token: "t", DomainV4: "a.example.com", Period: 0}
+func TestValidate_PeriodLowerBound(t *testing.T) {
+	c := config.Config{Token: "t", DomainV4: "a.example.com"}
+	for _, p := range []time.Duration{0, -time.Second, config.MinPeriod - time.Millisecond} {
+		c.Period = p
+		if err := c.ValidateRun(); err == nil || !strings.Contains(err.Error(), "-period") {
+			t.Errorf("period %v: err=%v, want -period error", p, err)
+		}
+	}
+	c.Period = config.MinPeriod
+	if err := c.ValidateRun(); err != nil {
+		t.Fatalf("MinPeriod should be accepted: %v", err)
+	}
+}
+
+func TestValidate_StrictHostname(t *testing.T) {
+	c := config.Config{Token: "t", Period: time.Minute}
+	for _, bad := range []string{
+		"nodot",
+		"has space.example.com",
+		"under_score.example.com",
+		"-lead.example.com",
+		"trail-.example.com",
+		"Upper.example.com", // validation expects normalized input
+		"a..example.com",
+		"trailingdot.example.com.",
+		strings.Repeat("a", 64) + ".example.com",
+		"ünïcode.example.com",
+		"foo.bar/baz.com",
+	} {
+		c.DomainV4 = bad
+		if err := c.ValidateRun(); err == nil {
+			t.Errorf("%q accepted, want error", bad)
+		}
+	}
+	for _, ok := range []string{"home.example.com", "a-b.c-d.example.co.uk", "xn--80ak6aa92e.com", "1.2.3.example.com"} {
+		c.DomainV4 = ok
+		if err := c.ValidateRun(); err != nil {
+			t.Errorf("%q rejected: %v", ok, err)
+		}
+	}
+}
+
+func TestValidate_V6IfaceRequiresV6(t *testing.T) {
+	c := config.Config{Token: "t", DomainV4: "a.example.com", Period: time.Minute, V6Iface: "eth0"}
 	if err := c.ValidateRun(); err == nil {
-		t.Fatal("expected period error")
+		t.Fatal("expected -6-iface requires -6")
+	}
+	c.DomainV6 = "a.example.com"
+	if err := c.ValidateRun(); err != nil {
+		t.Fatal(err)
+	}
+	c.V6Iface = "bad name"
+	if err := c.ValidateRun(); err == nil {
+		t.Fatal("expected invalid interface name")
+	}
+}
+
+func TestNormalizeDomain(t *testing.T) {
+	for in, want := range map[string]string{
+		"  Home.Example.COM. ": "home.example.com",
+		"home.example.com":     "home.example.com",
+		"":                     "",
+	} {
+		if got := config.NormalizeDomain(in); got != want {
+			t.Errorf("NormalizeDomain(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
 func TestLoadEnvFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "cfddns.env")
-	content := "CFDDNS_V4=home.example.com\nCFDDNS_TOKEN=abc\nCFDDNS_PERIOD=2m\n"
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	path := writeEnv(t, "CFDDNS_V4=home.example.com\nCFDDNS_TOKEN=abc\nCFDDNS_PERIOD=2m\n")
 	m, err := config.ParseEnvFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -72,11 +145,12 @@ func TestLoadEnvFile(t *testing.T) {
 	}
 }
 
-func TestApplyEnvMap_PeriodAndPort(t *testing.T) {
+func TestApplyEnvMap_PeriodPortIface(t *testing.T) {
 	c := config.Config{Period: config.DefaultPeriod}
 	if err := c.ApplyEnvMap(map[string]string{
-		"CFDDNS_PERIOD": "1m",
-		"CFDDNS_PORT":   "8080",
+		"CFDDNS_PERIOD":   "1m",
+		"CFDDNS_PORT":     "8080",
+		"CFDDNS_V6_IFACE": "eth0",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -86,78 +160,216 @@ func TestApplyEnvMap_PeriodAndPort(t *testing.T) {
 	if c.Port != 8080 {
 		t.Fatalf("port: got %d want 8080", c.Port)
 	}
+	if c.V6Iface != "eth0" {
+		t.Fatalf("iface: got %q", c.V6Iface)
+	}
 }
 
-func TestApplyEnvMap_PeriodInvalid(t *testing.T) {
+func TestApplyEnvMap_Invalid(t *testing.T) {
 	c := config.Config{Period: config.DefaultPeriod}
 	if err := c.ApplyEnvMap(map[string]string{"CFDDNS_PERIOD": "not-a-duration"}); err == nil {
 		t.Fatal("expected CFDDNS_PERIOD parse error")
 	}
-}
-
-func TestApplyEnvMap_PortInvalid(t *testing.T) {
-	c := config.Config{}
 	if err := c.ApplyEnvMap(map[string]string{"CFDDNS_PORT": "xyz"}); err == nil {
 		t.Fatal("expected CFDDNS_PORT parse error")
 	}
 }
 
-func TestModeConflict_InstallUninstall(t *testing.T) {
-	c := config.Config{Install: true, Uninstall: true}
-	if err := c.ModeConflict(); err == nil {
+func TestModeConflict(t *testing.T) {
+	if err := (config.Config{Install: true, Uninstall: true}).ModeConflict(); err == nil {
 		t.Fatal("expected install+uninstall conflict")
 	}
-}
-
-func TestModeConflict_OnceInstall(t *testing.T) {
-	c := config.Config{Once: true, Install: true}
-	if err := c.ModeConflict(); err == nil {
+	if err := (config.Config{Once: true, Install: true}).ModeConflict(); err == nil {
 		t.Fatal("expected once+install conflict")
 	}
-}
-
-func TestValidate_InvalidDomain(t *testing.T) {
-	c := config.Config{Token: "t", DomainV4: "nodot", Period: time.Minute}
-	if err := c.ValidateRun(); err == nil {
-		t.Fatal("expected invalid domain error")
+	if err := (config.Config{Init: "systemd"}).ModeConflict(); err == nil {
+		t.Fatal("expected -init without install/uninstall to be rejected")
 	}
-	c.DomainV4 = "has space.example.com"
-	if err := c.ValidateRun(); err == nil {
-		t.Fatal("expected invalid domain error for space")
+	if err := (config.Config{Init: "systemd", Install: true}).ModeConflict(); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestLoad_FlagsOverrideDefaults(t *testing.T) {
-	// Avoid inheriting ambient CFDDNS_* from the process environment.
-	for _, k := range []string{"CFDDNS_V4", "CFDDNS_V6", "CFDDNS_TOKEN", "CFDDNS_PERIOD", "CFDDNS_PORT", "CFDDNS_PASSWD"} {
-		t.Setenv(k, "")
-	}
-	c, err := config.Load([]string{"-4", "home.example.com", "-token", "x", "-period", "1m"})
+func TestLoad_FlagsOverrideEnvFileAndOSEnv(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("CFDDNS_TOKEN", "from-os-env")
+	t.Setenv("CFDDNS_PORT", "9090")
+	path := writeEnv(t, "CFDDNS_V4=file.example.com\nCFDDNS_TOKEN=from-file\nCFDDNS_PERIOD=2m\nCFDDNS_PORT=8080\nCFDDNS_PASSWD=filepw\n")
+
+	c, err := config.LoadFrom(path, []string{"-period", "1m"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.DomainV4 != "home.example.com" {
-		t.Fatalf("domain: got %q", c.DomainV4)
+	if c.DomainV4 != "file.example.com" {
+		t.Errorf("env file layer lost: V4=%q", c.DomainV4)
 	}
-	if c.Token != "x" {
-		t.Fatalf("token: got %q", c.Token)
+	if c.Token != "from-os-env" {
+		t.Errorf("OS env must beat env file: token=%q", c.Token)
+	}
+	if c.Port != 9090 {
+		t.Errorf("OS env must beat env file: port=%d", c.Port)
 	}
 	if c.Period != time.Minute {
-		t.Fatalf("period: got %v want 1m", c.Period)
+		t.Errorf("flag must beat env file: period=%v", c.Period)
+	}
+	if c.Passwd != "filepw" {
+		t.Errorf("untouched key must survive from file: passwd=%q", c.Passwd)
 	}
 }
 
-func TestUsage_ContainsFlagsAndJournalctl(t *testing.T) {
+func TestLoad_ExplicitEmptyFlagClearsEnvValue(t *testing.T) {
+	clearEnv(t)
+	path := writeEnv(t, "CFDDNS_V4=a.example.com\nCFDDNS_V6=b.example.com\nCFDDNS_TOKEN=t\n")
+	c, err := config.LoadFrom(path, []string{"-6", ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.DomainV6 != "" {
+		t.Fatalf("explicit -6 \"\" must clear: %q", c.DomainV6)
+	}
+	if c.DomainV4 != "a.example.com" {
+		t.Fatalf("V4 lost: %q", c.DomainV4)
+	}
+}
+
+func TestLoad_NormalizesDomains(t *testing.T) {
+	clearEnv(t)
+	c, err := config.LoadFrom(filepath.Join(t.TempDir(), "missing.env"), []string{"-4", "Home.Example.COM.", "-6", " V6.Example.com ", "-token", "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.DomainV4 != "home.example.com" || c.DomainV6 != "v6.example.com" {
+		t.Fatalf("not normalized: %q %q", c.DomainV4, c.DomainV6)
+	}
+	if err := c.ValidateRun(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoad_InstallIgnoresEnvFile(t *testing.T) {
+	clearEnv(t)
+	path := writeEnv(t, "CFDDNS_V4=old.example.com\nCFDDNS_V6=old6.example.com\nCFDDNS_TOKEN=old\nCFDDNS_PORT=8080\nCFDDNS_PASSWD=oldpw\n")
+	c, err := config.LoadFrom(path, []string{"-install", "-4", "new.example.com", "-token", "new"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.DomainV6 != "" || c.Port != 0 || c.Passwd != "" {
+		t.Fatalf("install must not inherit old env file: %+v", c)
+	}
+	if c.DomainV4 != "new.example.com" || c.Token != "new" {
+		t.Fatalf("flags lost: %+v", c)
+	}
+	if err := c.ValidateInstall(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoad_UninstallIgnoresCorruptEnvFile(t *testing.T) {
+	clearEnv(t)
+	path := writeEnv(t, "CFDDNS_PASSWD=\"quoted is not allowed\"\n")
+	if _, err := config.LoadFrom(path, nil); err == nil {
+		t.Fatal("run mode must reject a corrupt env file")
+	}
+	c, err := config.LoadFrom(path, []string{"-uninstall"})
+	if err != nil {
+		t.Fatalf("uninstall must not read the env file: %v", err)
+	}
+	if !c.Uninstall {
+		t.Fatal("Uninstall not set")
+	}
+}
+
+func TestLoad_MissingOrUnreadableEnvFileIsSkipped(t *testing.T) {
+	clearEnv(t)
+	c, err := config.LoadFrom(filepath.Join(t.TempDir(), "missing.env"), []string{"-4", "a.example.com", "-token", "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Period != config.DefaultPeriod {
+		t.Fatalf("period default lost: %v", c.Period)
+	}
+}
+
+func TestEnvFile_OmitsEmptyOptional(t *testing.T) {
+	c := config.Config{
+		DomainV4: "home.example.com",
+		Token:    "tok123",
+		Period:   5 * time.Minute,
+	}
+	got, err := c.EnvFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "CFDDNS_V4=home.example.com\nCFDDNS_TOKEN=tok123\nCFDDNS_PERIOD=5m0s\n"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestEnvFile_IncludesAllKeysInOrder(t *testing.T) {
+	c := config.Config{
+		DomainV4: "a.example.com",
+		DomainV6: "aaaa.example.com",
+		V6Iface:  "eth0",
+		Token:    "t",
+		Period:   time.Minute,
+		Port:     8080,
+		Passwd:   "secret",
+	}
+	got, err := c.EnvFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "CFDDNS_V4=a.example.com\nCFDDNS_V6=aaaa.example.com\nCFDDNS_V6_IFACE=eth0\nCFDDNS_TOKEN=t\nCFDDNS_PERIOD=1m0s\nCFDDNS_PORT=8080\nCFDDNS_PASSWD=secret\n"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestEnvFile_RoundTripsThroughParseEnvFile(t *testing.T) {
+	c := config.Config{DomainV4: "a.example.com", Token: "t", Period: time.Minute, Port: 8080, Passwd: "p@ss!w0rd$"}
+	body, err := c.EnvFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := config.ParseEnvFile(writeEnv(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back config.Config
+	if err := back.ApplyEnvMap(m); err != nil {
+		t.Fatal(err)
+	}
+	if back != (config.Config{DomainV4: "a.example.com", Token: "t", Period: time.Minute, Port: 8080, Passwd: "p@ss!w0rd$"}) {
+		t.Fatalf("round trip mismatch: %+v", back)
+	}
+}
+
+func TestValidateInstall_RejectsValueOutsideEnvGrammar(t *testing.T) {
+	c := config.Config{DomainV4: "a.example.com", Token: "t", Period: time.Minute, Port: 8080, Passwd: "has space"}
+	if err := c.ValidateRun(); err != nil {
+		t.Fatalf("run mode may use any passwd: %v", err)
+	}
+	err := c.ValidateInstall()
+	if err == nil || !strings.Contains(err.Error(), "CFDDNS_PASSWD") {
+		t.Fatalf("ValidateInstall = %v, want env grammar error naming CFDDNS_PASSWD", err)
+	}
+}
+
+func TestUsage_ContainsFlagsAndLogs(t *testing.T) {
 	var b strings.Builder
 	config.Usage(&b)
 	out := b.String()
 	for _, want := range []string{
-		"-4", "-6", "-token", "-period", "-port", "-passwd",
-		"-once", "-install", "-uninstall",
+		"-4", "-6", "-6-iface", "-token", "-period", "-port", "-passwd",
+		"-once", "-install", "-uninstall", "-init",
 		"journalctl -u cfddns -f",
 		"journalctl -u cfddns -n 100",
+		"/var/log/cfddns.log",
+		"logread -e cfddns",
 		"[required]",
 		"[optional",
+		"CFDDNS_V6_IFACE",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("Usage missing %q", want)
