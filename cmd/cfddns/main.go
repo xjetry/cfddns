@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -18,8 +20,10 @@ import (
 	"cfddns/internal/cloudflare"
 	"cfddns/internal/config"
 	"cfddns/internal/httpserver"
+	"cfddns/internal/inspector"
 	"cfddns/internal/install"
 	"cfddns/internal/ip"
+	"cfddns/internal/status"
 	"cfddns/internal/updater"
 )
 
@@ -82,17 +86,44 @@ func main() {
 		log.Fatal(err)
 	}
 
-	det := &ip.Detector{V6Iface: cfg.V6Iface}
 	dns := &cloudflare.Client{Token: cfg.Token}
+	if cfg.Inspect {
+		insp := inspector.Inspector{
+			DomainV4: cfg.DomainV4,
+			DomainV6: cfg.DomainV6,
+			DNS:      dns,
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := runInspect(ctx, &insp, os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	det := &ip.Detector{V6Iface: cfg.V6Iface}
 	up := &updater.Updater{
 		DomainV4: cfg.DomainV4,
 		DomainV6: cfg.DomainV6,
 		IP:       det,
 		DNS:      dns,
 	}
+	var statusRep *status.Reporter
+	if cfg.StatusFile != "" {
+		statusRep = status.New(status.Config{
+			Path:     cfg.StatusFile,
+			Period:   cfg.Period,
+			DomainV4: cfg.DomainV4,
+			DomainV6: cfg.DomainV6,
+		})
+		if err := statusRep.Clear(); err != nil {
+			log.Printf("status clear failed: %v", err)
+		}
+	}
 	rep := newReporter(log.Printf)
 	runOnce := func(ctx context.Context) ([]updater.Result, bool) {
 		results, ok := up.Run(ctx)
+		reportStatus(statusRep, results, log.Printf)
 		rep.report(results)
 		return results, ok
 	}
@@ -103,6 +134,13 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	}
+	if statusRep != nil {
+		defer func() {
+			if err := statusRep.Clear(); err != nil {
+				log.Printf("status clear failed: %v", err)
+			}
+		}()
 	}
 
 	// Between cycles the daemon only waits, so everything a cycle allocated
@@ -159,5 +197,24 @@ func main() {
 		case <-t.C:
 			runCycle(ctx)
 		}
+	}
+}
+
+// runInspect writes the {ok,results} envelope; failed family queries are
+// reported inside it, so only an encoding or write failure is returned.
+func runInspect(ctx context.Context, insp *inspector.Inspector, w io.Writer) error {
+	results, ok := insp.Inspect(ctx)
+	return json.NewEncoder(w).Encode(struct {
+		OK      bool               `json:"ok"`
+		Results []inspector.Result `json:"results"`
+	}{OK: ok, Results: results})
+}
+
+func reportStatus(rep *status.Reporter, results []updater.Result, logf func(string, ...any)) {
+	if rep == nil {
+		return
+	}
+	if err := rep.Report(results); err != nil {
+		logf("status report failed: %v", err)
 	}
 }

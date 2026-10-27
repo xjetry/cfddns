@@ -190,6 +190,56 @@ func TestModeConflict(t *testing.T) {
 	}
 }
 
+func TestModeConflict_StatusAndInspect(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     config.Config
+		wantErr bool
+	}{
+		{name: "inspect alone", cfg: config.Config{Inspect: true}},
+		{name: "inspect with once", cfg: config.Config{Inspect: true, Once: true}, wantErr: true},
+		{name: "inspect with install", cfg: config.Config{Inspect: true, Install: true}, wantErr: true},
+		{name: "inspect with uninstall", cfg: config.Config{Inspect: true, Uninstall: true}, wantErr: true},
+		{name: "status with daemon", cfg: config.Config{StatusFile: "/var/run/cfddns.status"}},
+		{name: "status with once", cfg: config.Config{StatusFile: "/var/run/cfddns.status", Once: true}},
+		{name: "status with inspect", cfg: config.Config{StatusFile: "/var/run/cfddns.status", Inspect: true}, wantErr: true},
+		{name: "status with install", cfg: config.Config{StatusFile: "/var/run/cfddns.status", Install: true}, wantErr: true},
+		{name: "status with uninstall", cfg: config.Config{StatusFile: "/var/run/cfddns.status", Uninstall: true}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.ModeConflict()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ModeConflict() = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoad_StatusFileFlag(t *testing.T) {
+	clearEnv(t)
+	path := filepath.Join(t.TempDir(), "missing.env")
+	c, err := config.LoadFrom(path, []string{"-status-file", "/var/run/cfddns.status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.StatusFile != "/var/run/cfddns.status" {
+		t.Fatalf("StatusFile = %q, want /var/run/cfddns.status", c.StatusFile)
+	}
+}
+
+func TestLoad_InspectFlag(t *testing.T) {
+	clearEnv(t)
+	path := filepath.Join(t.TempDir(), "missing.env")
+	c, err := config.LoadFrom(path, []string{"-inspect"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Inspect {
+		t.Fatal("Inspect = false, want true")
+	}
+}
+
 func TestLoad_FlagsOverrideEnvFileAndOSEnv(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("CFDDNS_TOKEN", "from-os-env")
@@ -326,6 +376,16 @@ func TestEnvFile_IncludesAllKeysInOrder(t *testing.T) {
 	}
 }
 
+func TestEnvPairs_DoesNotPersistStatusFile(t *testing.T) {
+	const statusPath = "/var/run/cfddns.status"
+	c := config.Config{Period: config.DefaultPeriod, StatusFile: statusPath}
+	for _, pair := range c.EnvPairs() {
+		if strings.Contains(strings.ToLower(pair.Key), "status") || pair.Value == statusPath {
+			t.Errorf("StatusFile persisted as %+v", pair)
+		}
+	}
+}
+
 func TestEnvFile_RoundTripsThroughParseEnvFile(t *testing.T) {
 	c := config.Config{DomainV4: "a.example.com", Token: "t", Period: time.Minute, Port: 8080, Passwd: "p@ss!w0rd$"}
 	body, err := c.EnvFile()
@@ -362,7 +422,7 @@ func TestUsage_ContainsFlagsAndLogs(t *testing.T) {
 	out := b.String()
 	for _, want := range []string{
 		"-4", "-6", "-6-iface", "-token", "-period", "-port", "-passwd",
-		"-once", "-install", "-uninstall", "-init",
+		"-once", "-inspect", "-status-file", "-install", "-uninstall", "-init",
 		"journalctl -u cfddns -f",
 		"journalctl -u cfddns -n 100",
 		"/var/log/cfddns.log",
@@ -370,6 +430,7 @@ func TestUsage_ContainsFlagsAndLogs(t *testing.T) {
 		"[required]",
 		"[optional",
 		"CFDDNS_V6_IFACE",
+		"Config merge for daemon/-once/-inspect:",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("Usage missing %q", want)

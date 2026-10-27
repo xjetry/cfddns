@@ -2,6 +2,7 @@ package updater_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -411,10 +412,113 @@ func TestRun_WaitingForLockRespectsContext(t *testing.T) {
 		if r.Action != updater.ActionError || !strings.Contains(r.Error, "waiting for a running update cycle") {
 			t.Fatalf("result %+v", r)
 		}
+		if r.DetectedAt != nil || r.FinishedAt == nil {
+			t.Fatalf("lock-wait timestamps: DetectedAt=%v FinishedAt=%v", r.DetectedAt, r.FinishedAt)
+		}
+		if r.FinishedAt.Location() != time.UTC {
+			t.Fatalf("FinishedAt location = %v, want UTC", r.FinishedAt.Location())
+		}
 	}
 	if time.Since(t0) > time.Second {
 		t.Fatal("waiter did not give up at its deadline")
 	}
 	close(block)
 	<-done
+}
+
+func TestRun_Timestamps(t *testing.T) {
+	const domain = "home.example.com"
+	const addr = "198.51.100.1"
+	zone := time.FixedZone("UTC+2", 2*60*60)
+	injected := []time.Time{
+		time.Date(2026, 10, 27, 12, 30, 1, 123456789, zone),
+		time.Date(2026, 10, 27, 12, 30, 5, 987654321, zone),
+	}
+	nowCalls := 0
+	up := &updater.Updater{
+		DomainV4: domain,
+		IP:       &fakeIP{v4: addr},
+		DNS:      &fakeDNS{records: oneRecord(domain, "rec-a", "A", addr)},
+		Now: func() time.Time {
+			if nowCalls >= len(injected) {
+				t.Fatalf("Now called %d times, want %d", nowCalls+1, len(injected))
+			}
+			now := injected[nowCalls]
+			nowCalls++
+			return now
+		},
+	}
+
+	results, allOK := up.Run(context.Background())
+	if !allOK || len(results) != 1 {
+		t.Fatalf("results=%+v allOK=%v", results, allOK)
+	}
+	if nowCalls != 2 {
+		t.Fatalf("Now calls=%d, want 2", nowCalls)
+	}
+	wantDetected := time.Date(2026, 10, 27, 10, 30, 1, 123456789, time.UTC)
+	wantFinished := time.Date(2026, 10, 27, 10, 30, 5, 987654321, time.UTC)
+	if got := results[0].DetectedAt; got == nil || !got.Equal(wantDetected) || got.Location() != time.UTC {
+		t.Fatalf("DetectedAt=%v, want %v in UTC", got, wantDetected)
+	}
+	if got := results[0].FinishedAt; got == nil || !got.Equal(wantFinished) || got.Location() != time.UTC {
+		t.Fatalf("FinishedAt=%v, want %v in UTC", got, wantFinished)
+	}
+}
+
+func TestRun_DetectFailureHasTimestamps(t *testing.T) {
+	up := &updater.Updater{
+		DomainV4: "home.example.com",
+		IP:       &fakeIP{v4: "203.0.113.10", v4Err: errors.New("detect failed")},
+		DNS:      &fakeDNS{},
+	}
+
+	results, allOK := up.Run(context.Background())
+	if allOK || len(results) != 1 {
+		t.Fatalf("results=%+v allOK=%v", results, allOK)
+	}
+	r := results[0]
+	if r.Action != updater.ActionError || r.Error == "" || r.IP != "" {
+		t.Fatalf("detect failure result=%+v", r)
+	}
+	if r.DetectedAt == nil || r.FinishedAt == nil {
+		t.Fatalf("detect failure timestamps: DetectedAt=%v FinishedAt=%v", r.DetectedAt, r.FinishedAt)
+	}
+}
+
+func TestSelectManagedRecord_SortsAndWarns(t *testing.T) {
+	const domain = "home.example.com"
+	records := []cloudflare.Record{
+		{ID: "b", Type: "A", Name: domain},
+		{ID: "a", Type: "A", Name: domain},
+	}
+
+	rec, warning := updater.SelectManagedRecord(records, "A", domain)
+	if rec.ID != "a" {
+		t.Fatalf("selected ID=%q, want a", rec.ID)
+	}
+	const wantWarning = "2 A records named home.example.com; only a is managed, the other 1 keep their content"
+	if warning != wantWarning {
+		t.Fatalf("warning=%q, want %q", warning, wantWarning)
+	}
+}
+
+func TestSelectManagedRecord_Empty(t *testing.T) {
+	rec, warning := updater.SelectManagedRecord(nil, "A", "home.example.com")
+	if rec != (cloudflare.Record{}) || warning != "" {
+		t.Fatalf("record=%+v warning=%q, want zero record and empty warning", rec, warning)
+	}
+}
+
+func TestResult_TimestampsNotInJSON(t *testing.T) {
+	now := time.Date(2026, 10, 27, 10, 30, 0, 0, time.UTC)
+	payload, err := json.Marshal(updater.Result{DetectedAt: &now, FinishedAt: &now})
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	for _, field := range []string{"DetectedAt", "FinishedAt"} {
+		if strings.Contains(string(payload), field) {
+			t.Errorf("JSON %s contains timestamp field %q", payload, field)
+		}
+	}
 }

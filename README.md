@@ -6,6 +6,7 @@ Cloudflare DDNS：把本机公网 IPv4 / IPv6 同步到 Cloudflare A / AAAA 记�
 - 周期更新，zone / 记录 ID 缓存，IP 不变时不调 Cloudflare API
 - 一键安装 / 升级 / 卸载
 - 可选 HTTP 手动触发
+- 可选运行状态文件（JSON）；`-inspect` 只读查询 Cloudflare 当前记录
 - IPv6 可从指定网卡取稳定地址，避开隐私扩展的临时地址
 - 缺 v4 / v6 栈 soft-fail，daemon 不退出
 
@@ -46,7 +47,7 @@ wget -qO- https://raw.githubusercontent.com/xjetry/cfddns/main/install.sh \
   | sh -s -- -4 home.example.com -token 'YOUR_CF_TOKEN' -port 8080 -passwd 'YOUR_HTTP_SECRET'
 ```
 
-`install.sh` 认两个环境变量：`CFDDNS_VERSION=v0.2.0` 装指定版本，`CFDDNS_ASSET=mipsle` 强制产物。
+`install.sh` 认两个环境变量：`CFDDNS_VERSION=v0.3.0` 装指定版本，`CFDDNS_ASSET=mipsle` 强制产物。
 
 ### 手动下载
 
@@ -107,6 +108,14 @@ HTTP（若装时开了 `-port` / `-passwd`）：
 curl -sS -H "Authorization: Bearer YOUR_HTTP_SECRET" -X POST http://127.0.0.1:8080/update
 ```
 
+### 查看 Cloudflare 当前记录
+
+```sh
+sudo cfddns -inspect
+```
+
+只读，不改记录，输出 JSON，见 [状态文件与 inspect](#状态文件与-inspect)。
+
 ---
 
 ## Cloudflare API token
@@ -138,6 +147,8 @@ cfddns -h
 | `-port` | `CFDDNS_PORT` | 不开启 | HTTP 端口 |
 | `-passwd` | `CFDDNS_PASSWD` | — | 与 `-port` 联用，Bearer 密钥 |
 | `-once` | — | false | 只跑一轮后退出 |
+| `-inspect` | — | false | 只读查询 Cloudflare 当前记录，输出 JSON 后退出 |
+| `-status-file` | — | 不开启 | 运行状态 JSON 写到该路径；仅 daemon / `-once` |
 | `-install` | — | false | 安装为服务（需 root） |
 | `-uninstall` | — | false | 卸载（需 root） |
 | `-init` | — | 自动 | `-install` / `-uninstall` 用的 init：`systemd` `openrc` `procd` |
@@ -146,8 +157,10 @@ cfddns -h
 
 - `-4` / `-6` **至少一个**；域名统一转小写，须是 RFC 1123 主机名（IDN 用 punycode）
 - 开了 `-port` 必须带 `-passwd`
-- daemon / `-once` 的配置合并：defaults → `/etc/cfddns.env` → 进程环境变量 → CLI
+- daemon / `-once` / `-inspect` 的配置合并：defaults → `/etc/cfddns.env` → 进程环境变量 → CLI
 - `-install` 只认进程环境变量 + CLI，不合并旧的 `/etc/cfddns.env`
+- `-status-file` 只是运行参数：没有环境变量，`-install` 不写进 `/etc/cfddns.env`，生成的服务定义也不带它
+- `-inspect` 不能与 `-once` / `-install` / `-uninstall` 同用；`-status-file` 不能与 `-inspect` / `-install` / `-uninstall` 同用
 - `/etc/cfddns.env` 的值是裸 `KEY=value`：可见 ASCII，不含空白、引号、反斜杠、`#`、`;`；`-token` / `-passwd` 要能装进这个格式
 - 缺对应 IP 栈：该族失败并打日志，**daemon 不退出**
 
@@ -159,16 +172,82 @@ cfddns -h
 |------|------|
 | 默认 daemon | 启动先更新一次，再按 `-period` 循环；可选 HTTP |
 | `-once` | 更新一轮；全部族成功 exit 0，否则非 0 |
+| `-inspect` | 只读查询一次，JSON 写到 stdout；配置有效即 exit 0 |
 | `-install` | 装二进制 + env + 服务定义，开机自启并 restart |
 | `-uninstall` | 停服务、取消自启，删服务定义 / env / 二进制 |
 
 - **IP 探测**：Cloudflare `cdn-cgi/trace`，强制 v4 / v6 拨号，直连不走代理。`-6-iface` 指定时读 `/proc/net/if_inet6`，取该网卡非临时、非弃用的全局单播地址（手动配置的优先），没有则回退 trace；结果的 `source` 字段说明来源。
 - **DNS 写入**：记录不存在时创建，DNS only（`proxied=false`，TTL auto）；已存在时用 PATCH 只改 `content`，面板上设的 proxied / TTL / comment / tags 原样保留。
 - **缓存**：首次解析后缓存 zone ID 与记录 ID，IP 不变的周期不调 API，IP 变了直接 PATCH；每 12 个周期全量核对一次，面板手改会在核对时被纠正。
-- **同名多条记录**：按 ID 排序只管第一条，其余保持原内容，并在日志和 HTTP 结果里给出 `warning`。
+- **同名多条记录**：按 ID 排序只管第一条，其余保持原内容，并在日志、HTTP 结果、状态文件和 `-inspect` 输出里给出 `warning`。
 - **日志**：created / updated / error 每次打；`unchanged` 只在首轮和状态变化后打一次，稳态不刷日志。
 - **HTTP**：`/update` 单次更新 2 分钟超时，连接有读头 / 读 / 空闲超时；更新互斥，等锁超时直接返回 `ok:false`。
 - **内存**：GOMAXPROCS=1；每轮结束关闭空闲连接并把堆页归还 OS；API 客户端只用 HTTP/1.1。见[内存](#内存)。
+
+---
+
+## 状态文件与 inspect
+
+两者输出都不含 Token，时间都是 RFC 3339 UTC，带小数秒（最多 9 位，末尾 0 省略）。
+
+### 状态文件
+
+默认关闭，显式传 `-status-file <path>` 才写。OpenWrt 打包（后续的 `cfddns-openwrt` feed）会以 `-status-file /var/run/cfddns.status` 运行 daemon，该路径在 tmpfs，不写 Flash。
+
+- 每轮结束后原子替换（同目录临时文件 + rename），权限 `0644`，读到的总是完整 JSON
+- 首轮前删掉旧文件；daemon 正常退出（SIGINT / SIGTERM）时删除；`-once` 保留最后一轮结果
+- 写入 / 删除失败只打日志，不影响更新结果和退出码，daemon 不退出
+
+内容（实际为单行）：
+
+```json
+{
+  "version": 1,
+  "started_at": "2026-10-27T08:00:00.412345678Z",
+  "written_at": "2026-10-27T08:05:01.734512Z",
+  "period": "5m0s",
+  "families": [
+    {
+      "family": "ipv4",
+      "domain": "home.example.com",
+      "record_type": "A",
+      "detection": {"at": "2026-10-27T08:05:00.218734Z", "ip": "203.0.113.10", "source": "trace", "error": ""},
+      "execution": {"at": "2026-10-27T08:05:01.733901Z", "action": "unchanged", "error": "", "warning": ""}
+    }
+  ]
+}
+```
+
+- `detection` / `execution` 在该族尚无对应结果时不出现（omitempty），不是 `null`
+- `detection`：最近一次 IP 探测；探测失败时 `ip` 为空、不保留旧 IP，`execution.action` 为 `error` 而 `execution.error` 为空，错误原因只在 `detection.error`
+- `execution`：最近一次同步完成，`action` 为 `created` / `updated` / `unchanged` / `error`；`unchanged` 也是已执行
+- HTTP 触发等锁超时只更新 `execution`，`detection` 保持上一次探测
+
+### inspect
+
+```sh
+sudo cfddns -inspect
+```
+
+- 配置合并与 `-once` 相同（要读 `0600` 的 `/etc/cfddns.env`，所以一般要 root）
+- 只调 zone / 记录查询接口，不创建、不 PATCH、不触发更新，也不用 daemon 的缓存
+- 各族独立查询，整体 2 分钟超时
+- 同名多条记录按更新时的规则取 ID 排序第一条，并给出 `warning`
+
+stdout（实际为单行）：
+
+```json
+{
+  "ok": true,
+  "results": [
+    {"family": "ipv4", "domain": "home.example.com", "record_type": "A", "found": true, "content": "203.0.113.10", "queried_at": "2026-10-27T08:10:00.531208Z", "warning": "", "error": ""}
+  ]
+}
+```
+
+- 记录不存在：`found:false`、`content` 为空；这是成功查询，`ok` 不会因此变 false
+- zone / 记录查询失败：该族 `error` 有值、`ok:false`，另一族仍会返回结果；两族共享整体 2 分钟超时，超时时可能两族都带 `error`
+- 配置有效就输出 JSON 并 exit 0，即使 `ok:false`，调用方看 `ok` 和各族 `error`；配置或参数错误打到 stderr 并非 0 退出，不输出 JSON
 
 ---
 
@@ -212,5 +291,5 @@ CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -ldflags="-s -w
 CI：push `main` 跑 gofmt / vet / staticcheck / `go test -race` 并构建六个架构的 Artifact；推送 tag `v*` 发布 Release（六个二进制 + `SHA256SUMS`）。
 
 ```sh
-git tag v0.2.0 && git push origin v0.2.0
+git tag v0.3.0 && git push origin v0.3.0
 ```
