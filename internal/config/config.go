@@ -42,13 +42,15 @@ type Config struct {
 	DomainV6 string
 	// V6Iface names the interface whose stable global IPv6 address is used
 	// for the AAAA record instead of the trace answer; empty means trace only.
-	V6Iface string
-	Token   string
-	Period  time.Duration
-	Port    int // 0 = HTTP disabled
-	Passwd  string
-	Once    bool
-	Install bool
+	V6Iface    string
+	Token      string
+	Period     time.Duration
+	Port       int // 0 = HTTP disabled
+	Passwd     string
+	StatusFile string // runtime-only; never persisted
+	Once       bool
+	Inspect    bool
+	Install    bool
 	// Init selects the init system for -install/-uninstall: "" (auto-detect),
 	// systemd, openrc or procd. Never persisted.
 	Init      string
@@ -143,6 +145,7 @@ func Usage(w io.Writer) {
 Usage:
   cfddns [flags]                 run as daemon (period updates)
   cfddns -once [flags]           run one update cycle and exit
+  cfddns -inspect [flags]        read current Cloudflare records and exit
   cfddns -install [flags]        install binary + %[2]s + service (root)
   cfddns -uninstall              remove service, env, and binary (root)
   cfddns -h                      show this help
@@ -165,6 +168,10 @@ Flags:
         [required if -port] Bearer secret for HTTP /update (env %[10]s)
   -once
         [optional]  one-shot update then exit (0 if all families ok, else 1)
+  -inspect
+        [optional]  read current Cloudflare A/AAAA records as JSON and exit
+  -status-file string
+        [optional]  write runtime status JSON to this path (daemon/-once only)
   -install
         [optional]  install as a service (needs same -4/-6/-token/... as run)
   -uninstall
@@ -175,7 +182,7 @@ Flags:
   -h, -help
         show this help
 
-* At least one of -4 or -6 is required for daemon, -once, and -install.
+* At least one of -4 or -6 is required for daemon, -once, -inspect, and -install.
 
 Rules:
   - Config merge for daemon/-once: defaults → %[2]s → process env → CLI flags
@@ -243,7 +250,9 @@ func LoadFrom(envPath string, args []string) (Config, error) {
 	fs.DurationVar(&fl.Period, "period", DefaultPeriod, "update interval")
 	fs.IntVar(&fl.Port, "port", 0, "HTTP port; 0=disabled")
 	fs.StringVar(&fl.Passwd, "passwd", "", "Bearer secret")
+	fs.StringVar(&fl.StatusFile, "status-file", "", "write runtime status JSON to path")
 	fs.BoolVar(&fl.Once, "once", false, "one-shot update then exit")
+	fs.BoolVar(&fl.Inspect, "inspect", false, "read current Cloudflare records and exit")
 	fs.BoolVar(&fl.Install, "install", false, "install service (root)")
 	fs.BoolVar(&fl.Uninstall, "uninstall", false, "uninstall service (root)")
 	fs.StringVar(&fl.Init, "init", "", "init system: systemd|openrc|procd")
@@ -252,7 +261,8 @@ func LoadFrom(envPath string, args []string) (Config, error) {
 	}
 	set := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
-	c.Once, c.Install, c.Uninstall, c.Init = fl.Once, fl.Install, fl.Uninstall, fl.Init
+	c.Once, c.Inspect, c.Install, c.Uninstall, c.Init = fl.Once, fl.Inspect, fl.Install, fl.Uninstall, fl.Init
+	c.StatusFile = fl.StatusFile
 
 	if !c.Install && !c.Uninstall {
 		// Missing or permission-denied (root 0600 while a non-root run passes
@@ -417,6 +427,15 @@ func (c Config) ModeConflict() error {
 	}
 	if c.Init != "" && !c.Install && !c.Uninstall {
 		return errors.New("-init only applies to -install/-uninstall")
+	}
+	if c.Inspect && (c.Once || c.Install || c.Uninstall) {
+		return errors.New("cannot combine -inspect with -once/-install/-uninstall")
+	}
+	if c.StatusFile != "" && c.Inspect {
+		return errors.New("cannot combine -status-file with -inspect")
+	}
+	if c.StatusFile != "" && (c.Install || c.Uninstall) {
+		return errors.New("cannot combine -status-file with -install/-uninstall")
 	}
 	return nil
 }
