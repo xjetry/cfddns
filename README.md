@@ -188,7 +188,7 @@ cfddns -h
 
 ## 状态文件与 inspect
 
-两者输出都不含 Token，时间都是 RFC 3339 UTC。
+两者输出都不含 Token，时间都是 RFC 3339 UTC，带小数秒（最多 9 位，末尾 0 省略）。
 
 ### 状态文件
 
@@ -203,22 +203,23 @@ cfddns -h
 ```json
 {
   "version": 1,
-  "started_at": "2026-10-27T08:00:00Z",
-  "written_at": "2026-10-27T08:05:01Z",
+  "started_at": "2026-10-27T08:00:00.412345678Z",
+  "written_at": "2026-10-27T08:05:01.734512Z",
   "period": "5m0s",
   "families": [
     {
       "family": "ipv4",
       "domain": "home.example.com",
       "record_type": "A",
-      "detection": {"at": "2026-10-27T08:05:00Z", "ip": "203.0.113.10", "source": "trace", "error": ""},
-      "execution": {"at": "2026-10-27T08:05:01Z", "action": "unchanged", "error": "", "warning": ""}
+      "detection": {"at": "2026-10-27T08:05:00.218734Z", "ip": "203.0.113.10", "source": "trace", "error": ""},
+      "execution": {"at": "2026-10-27T08:05:01.733901Z", "action": "unchanged", "error": "", "warning": ""}
     }
   ]
 }
 ```
 
-- `detection`：最近一次 IP 探测；探测失败时 `ip` 为空、错误在 `detection.error`，`execution.action` 为 `error`，不保留旧 IP
+- `detection` / `execution` 在该族尚无对应结果时不出现（omitempty），不是 `null`
+- `detection`：最近一次 IP 探测；探测失败时 `ip` 为空、不保留旧 IP，`execution.action` 为 `error` 而 `execution.error` 为空，错误原因只在 `detection.error`
 - `execution`：最近一次同步完成，`action` 为 `created` / `updated` / `unchanged` / `error`；`unchanged` 也是已执行
 - HTTP 触发等锁超时只更新 `execution`，`detection` 保持上一次探测
 
@@ -239,13 +240,13 @@ stdout（实际为单行）：
 {
   "ok": true,
   "results": [
-    {"family": "ipv4", "domain": "home.example.com", "record_type": "A", "found": true, "content": "203.0.113.10", "queried_at": "2026-10-27T08:10:00Z", "warning": "", "error": ""}
+    {"family": "ipv4", "domain": "home.example.com", "record_type": "A", "found": true, "content": "203.0.113.10", "queried_at": "2026-10-27T08:10:00.531208Z", "warning": "", "error": ""}
   ]
 }
 ```
 
 - 记录不存在：`found:false`、`content` 为空；这是成功查询，`ok` 不会因此变 false
-- zone / 记录查询失败：该族 `error` 有值、`ok:false`，另一族照常返回
+- zone / 记录查询失败：该族 `error` 有值、`ok:false`，另一族仍会返回结果；两族共享整体 2 分钟超时，超时时可能两族都带 `error`
 - 配置有效就输出 JSON 并 exit 0，即使 `ok:false`，调用方看 `ok` 和各族 `error`；配置或参数错误打到 stderr 并非 0 退出，不输出 JSON
 
 ---

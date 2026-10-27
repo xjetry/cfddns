@@ -185,7 +185,7 @@ Flags:
 * At least one of -4 or -6 is required for daemon, -once, -inspect, and -install.
 
 Rules:
-  - Config merge for daemon/-once: defaults → %[2]s → process env → CLI flags
+  - Config merge for daemon/-once/-inspect: defaults → %[2]s → process env → CLI flags
   - -install persists exactly process env + CLI flags; it never merges an
     existing %[2]s, so re-running -install replaces the old configuration
   - Domains are lower-cased and must be RFC 1123 host names (use punycode for IDN)

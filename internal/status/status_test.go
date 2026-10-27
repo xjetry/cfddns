@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -117,6 +118,84 @@ func TestReporterReportWritesSnapshot(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("snapshot mismatch\ngot:  %+v\nwant: %+v", got, want)
+	}
+}
+
+func sortedKeys(t *testing.T, raw json.RawMessage) []string {
+	t.Helper()
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("decode object %s: %v", raw, err)
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func TestReporterReport_KeySets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cfddns.status")
+	zone := time.FixedZone("UTC+2", 2*60*60)
+	now := time.Date(2026, 10, 27, 10, 5, 1, 734512000, zone)
+	reporter := New(Config{
+		Path:     path,
+		Period:   5 * time.Minute,
+		DomainV4: "v4.example.com",
+		DomainV6: "v6.example.com",
+		Now:      func() time.Time { return now },
+	})
+	detected := now.Add(-time.Second)
+	if err := reporter.Report([]updater.Result{{
+		Family:     "ipv4",
+		IP:         "203.0.113.10",
+		Source:     "trace",
+		Action:     updater.ActionUnchanged,
+		DetectedAt: &detected,
+		FinishedAt: &now,
+	}}); err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+
+	if got, want := sortedKeys(t, data), []string{"families", "period", "started_at", "version", "written_at"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("top-level keys = %q, want %q", got, want)
+	}
+	var top struct {
+		WrittenAt json.RawMessage   `json:"written_at"`
+		Families  []json.RawMessage `json:"families"`
+	}
+	if err := json.Unmarshal(data, &top); err != nil {
+		t.Fatalf("decode snapshot %s: %v", data, err)
+	}
+	if got, want := string(top.WrittenAt), `"2026-10-27T08:05:01.734512Z"`; got != want {
+		t.Fatalf("written_at = %s, want %s", got, want)
+	}
+	if len(top.Families) != 2 {
+		t.Fatalf("families = %s, want 2 entries", data)
+	}
+	if got, want := sortedKeys(t, top.Families[0]), []string{"detection", "domain", "execution", "family", "record_type"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("reported family keys = %q, want %q", got, want)
+	}
+	if got, want := sortedKeys(t, top.Families[1]), []string{"domain", "family", "record_type"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unreported family keys = %q, want %q", got, want)
+	}
+	var family struct {
+		Detection json.RawMessage `json:"detection"`
+		Execution json.RawMessage `json:"execution"`
+	}
+	if err := json.Unmarshal(top.Families[0], &family); err != nil {
+		t.Fatalf("decode family %s: %v", top.Families[0], err)
+	}
+	if got, want := sortedKeys(t, family.Detection), []string{"at", "error", "ip", "source"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("detection keys = %q, want %q", got, want)
+	}
+	if got, want := sortedKeys(t, family.Execution), []string{"action", "at", "error", "warning"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("execution keys = %q, want %q", got, want)
 	}
 }
 

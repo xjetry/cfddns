@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -94,11 +95,7 @@ func main() {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		results, ok := insp.Inspect(ctx)
-		if err := json.NewEncoder(os.Stdout).Encode(struct {
-			OK      bool               `json:"ok"`
-			Results []inspector.Result `json:"results"`
-		}{OK: ok, Results: results}); err != nil {
+		if err := runInspect(ctx, &insp, os.Stdout); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -201,6 +198,16 @@ func main() {
 			runCycle(ctx)
 		}
 	}
+}
+
+// runInspect writes the {ok,results} envelope; failed family queries are
+// reported inside it, so only an encoding or write failure is returned.
+func runInspect(ctx context.Context, insp *inspector.Inspector, w io.Writer) error {
+	results, ok := insp.Inspect(ctx)
+	return json.NewEncoder(w).Encode(struct {
+		OK      bool               `json:"ok"`
+		Results []inspector.Result `json:"results"`
+	}{OK: ok, Results: results})
 }
 
 func reportStatus(rep *status.Reporter, results []updater.Result, logf func(string, ...any)) {

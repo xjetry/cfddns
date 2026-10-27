@@ -430,6 +430,7 @@ func TestUsage_ContainsFlagsAndLogs(t *testing.T) {
 		"[required]",
 		"[optional",
 		"CFDDNS_V6_IFACE",
+		"Config merge for daemon/-once/-inspect:",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("Usage missing %q", want)
