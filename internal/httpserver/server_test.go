@@ -204,3 +204,32 @@ func TestHTTPServer_TimeoutsSet(t *testing.T) {
 		t.Fatalf("WriteTimeout %v must outlast RunTimeout %v", srv.WriteTimeout, httpserver.RunTimeout)
 	}
 }
+
+func TestUpdate_BearerSchemeIsCaseInsensitive(t *testing.T) {
+	s := &httpserver.Server{Passwd: "secret", Run: func(ctx context.Context) ([]updater.Result, bool) { return nil, true }}
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	try := func(header string) int {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/update", nil)
+		req.Header.Set("Authorization", header)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	// RFC 7235: the scheme is case-insensitive; RFC 6750: one or more spaces
+	// separate it from the token.
+	for _, ok := range []string{"Bearer secret", "bearer secret", "BEARER secret", "Bearer  secret"} {
+		if got := try(ok); got != http.StatusOK {
+			t.Errorf("%q: status %d, want 200", ok, got)
+		}
+	}
+	for _, bad := range []string{"Bearersecret", "Bearer", "Bearer ", "Basic secret", "Bearer secret2", "secret"} {
+		if got := try(bad); got != http.StatusUnauthorized {
+			t.Errorf("%q: status %d, want 401", bad, got)
+		}
+	}
+}

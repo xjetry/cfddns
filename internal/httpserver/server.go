@@ -77,12 +77,19 @@ type response struct {
 	Results []updater.Result `json:"results"`
 }
 
+// bearerOK accepts "Bearer <token>" as RFC 6750 defines it: the scheme is
+// case-insensitive (RFC 7235) and one or more spaces separate it from the
+// token.
 func bearerOK(header, passwd string) bool {
-	const prefix = "Bearer "
-	if !strings.HasPrefix(header, prefix) {
+	const scheme = "Bearer"
+	if len(header) <= len(scheme) || !strings.EqualFold(header[:len(scheme)], scheme) {
 		return false
 	}
-	got := strings.TrimPrefix(header, prefix)
+	rest := header[len(scheme):]
+	got := strings.TrimLeft(rest, " ")
+	if len(got) == len(rest) || got == "" {
+		return false // no separator, or no token
+	}
 	// ConstantTimeCompare returns 0 when lengths differ (no panic).
 	return subtle.ConstantTimeCompare([]byte(got), []byte(passwd)) == 1
 }

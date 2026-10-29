@@ -3,6 +3,7 @@ package cloudflare_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -284,5 +285,91 @@ func TestDefaultClient_HTTP1OnlyAndCloseIdle(t *testing.T) {
 	c.CloseIdleConnections()
 	if _, err := c.FindRecords(context.Background(), "zid", "A", "home.example.com"); err != nil {
 		t.Fatalf("client must keep working after CloseIdleConnections: %v", err)
+	}
+}
+
+func TestAPIError_CarriesHTTPStatus(t *testing.T) {
+	status := http.StatusNotFound
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": false,
+			"errors":  []map[string]any{{"code": 81044, "message": "Record does not exist."}},
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	c := &cloudflare.Client{Token: "t", BaseURL: srv.URL, HTTPClient: srv.Client()}
+	err := c.UpdateRecordContent(context.Background(), "zid", "gone", "198.51.100.1")
+	if err == nil || !strings.Contains(err.Error(), "Record does not exist") {
+		t.Fatalf("err = %v", err)
+	}
+	if !cloudflare.IsNotFound(err) {
+		t.Fatalf("a 404 envelope must be reported as not found: %v", err)
+	}
+
+	status = http.StatusTooManyRequests
+	err = c.UpdateRecordContent(context.Background(), "zid", "gone", "198.51.100.1")
+	if err == nil || cloudflare.IsNotFound(err) {
+		t.Fatalf("a 429 must not look like a missing record: %v", err)
+	}
+	if cloudflare.IsNotFound(errors.New("plain")) {
+		t.Fatal("a non-API error is never not-found")
+	}
+}
+
+func TestDeleteRecord(t *testing.T) {
+	var gotMethod, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		writeJSON(w, map[string]any{"success": true, "result": map[string]string{"id": "rec1"}})
+	}))
+	t.Cleanup(srv.Close)
+
+	c := &cloudflare.Client{Token: "tok", BaseURL: srv.URL, HTTPClient: srv.Client()}
+	if err := c.DeleteRecord(context.Background(), "zid", "rec1"); err != nil {
+		t.Fatalf("DeleteRecord: %v", err)
+	}
+	if gotMethod != http.MethodDelete || gotPath != "/zones/zid/dns_records/rec1" {
+		t.Fatalf("%s %s", gotMethod, gotPath)
+	}
+}
+
+func TestFindRecords_Paginates(t *testing.T) {
+	var pages []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		pages = append(pages, page)
+		switch page {
+		case "1":
+			writeJSON(w, map[string]any{
+				"success":     true,
+				"result":      []map[string]any{{"id": "rec1", "type": "A", "name": "home.example.com", "content": "203.0.113.1"}},
+				"result_info": map[string]int{"page": 1, "per_page": 100, "total_pages": 2, "count": 1, "total_count": 2},
+			})
+		case "2":
+			writeJSON(w, map[string]any{
+				"success":     true,
+				"result":      []map[string]any{{"id": "rec2", "type": "A", "name": "home.example.com", "content": "203.0.113.2"}},
+				"result_info": map[string]int{"page": 2, "per_page": 100, "total_pages": 2, "count": 1, "total_count": 2},
+			})
+		default:
+			t.Errorf("unexpected page %q", page)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	c := &cloudflare.Client{Token: "t", BaseURL: srv.URL, HTTPClient: srv.Client()}
+	recs, err := c.FindRecords(context.Background(), "zid", "A", "home.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 2 || recs[0].ID != "rec1" || recs[1].ID != "rec2" {
+		t.Fatalf("got %+v", recs)
+	}
+	if strings.Join(pages, ",") != "1,2" {
+		t.Fatalf("pages requested: %v", pages)
 	}
 }

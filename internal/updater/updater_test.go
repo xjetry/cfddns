@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,14 +50,22 @@ type fakeDNS struct {
 	// key: type+"|"+name
 	records map[string][]cloudflare.Record
 
-	// updateErrs are consumed one per UpdateRecordContent call.
+	// updateErrs are consumed one per UpdateRecordContent call; findErrs one
+	// per FindRecords call (a nil entry answers normally).
 	updateErrs []error
+	findErrs   []error
 	nextID     int
+	// afterCreate runs once the created record is stored, before it is
+	// returned: the hook stands in for another process acting on the zone
+	// in the same instant.
+	afterCreate func()
 
 	zoneCalls int
 	findCalls int
 	creates   []cloudflare.Record
 	updates   []updateCall
+	deletes   []string
+	deleteErr error
 }
 
 func (d *fakeDNS) ZoneIDFor(_ context.Context, _ string) (string, error) {
@@ -75,6 +84,13 @@ func (d *fakeDNS) FindRecords(_ context.Context, _, typ, name string) ([]cloudfl
 	if d.findErr != nil {
 		return nil, d.findErr
 	}
+	if len(d.findErrs) > 0 {
+		err := d.findErrs[0]
+		d.findErrs = d.findErrs[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	out := append([]cloudflare.Record(nil), d.records[typ+"|"+name]...)
 	return out, nil
 }
@@ -87,7 +103,27 @@ func (d *fakeDNS) CreateRecord(_ context.Context, _ string, typ, name, content s
 		d.records = map[string][]cloudflare.Record{}
 	}
 	d.records[typ+"|"+name] = append(d.records[typ+"|"+name], rec)
+	if d.afterCreate != nil {
+		d.afterCreate()
+	}
 	return rec, nil
+}
+
+func (d *fakeDNS) DeleteRecord(_ context.Context, _, id string) error {
+	d.deletes = append(d.deletes, id)
+	if d.deleteErr != nil {
+		return d.deleteErr
+	}
+	for k, recs := range d.records {
+		kept := recs[:0]
+		for _, r := range recs {
+			if r.ID != id {
+				kept = append(kept, r)
+			}
+		}
+		d.records[k] = kept
+	}
+	return nil
 }
 
 func (d *fakeDNS) UpdateRecordContent(_ context.Context, zoneID, id, content string) error {
@@ -289,7 +325,7 @@ func TestRun_StaleCacheFallsBackToFullResolve(t *testing.T) {
 	// Simulate the record having been recreated in the dashboard: the cached
 	// ID no longer exists, the first PATCH fails.
 	dns.records = oneRecord(domain, "rec-b", "A", "198.51.100.1")
-	dns.updateErrs = []error{errors.New("cloudflare api: record not found")}
+	dns.updateErrs = []error{&cloudflare.APIError{Status: 404}}
 	det.v4 = "198.51.100.2"
 
 	results, ok := up.Run(context.Background())
@@ -417,4 +453,247 @@ func TestRun_WaitingForLockRespectsContext(t *testing.T) {
 	}
 	close(block)
 	<-done
+}
+
+func TestRun_CachedPatchTransientErrorKeepsCache(t *testing.T) {
+	const domain = "home.example.com"
+	dns := &fakeDNS{records: oneRecord(domain, "rec-a", "A", "198.51.100.1")}
+	det := &fakeIP{v4: "198.51.100.1"}
+	up := &updater.Updater{DomainV4: domain, IP: det, DNS: dns}
+	up.Run(context.Background())
+
+	// Rate limited (429) and a transport failure: the record is still there,
+	// so the cycle must report the error and leave the cached IDs for the
+	// next cycle instead of spending three more calls on a resolve.
+	det.v4 = "198.51.100.2"
+	dns.updateErrs = []error{&cloudflare.APIError{Status: 429}, errors.New("dial tcp: i/o timeout")}
+	for i := 0; i < 2; i++ {
+		results, ok := up.Run(context.Background())
+		if ok || results[0].Action != updater.ActionError {
+			t.Fatalf("cycle %d: %+v", i, results)
+		}
+	}
+	if dns.zoneCalls != 1 || dns.findCalls != 1 {
+		t.Fatalf("a transient PATCH failure must not trigger a resolve: zone=%d find=%d", dns.zoneCalls, dns.findCalls)
+	}
+	if len(dns.updates) != 2 {
+		t.Fatalf("every cycle must retry the PATCH: %+v", dns.updates)
+	}
+
+	// Once the API answers again the cached record is patched without lookups.
+	results, ok := up.Run(context.Background())
+	if !ok || results[0].Action != updater.ActionUpdated || dns.findCalls != 1 {
+		t.Fatalf("recovery: %+v find=%d", results, dns.findCalls)
+	}
+	if last := dns.updates[len(dns.updates)-1]; last.id != "rec-a" || last.content != "198.51.100.2" {
+		t.Fatalf("updates: %+v", dns.updates)
+	}
+}
+
+func TestRun_CachedCyclesKeepDuplicateWarning(t *testing.T) {
+	const domain = "home.example.com"
+	dns := &fakeDNS{records: map[string][]cloudflare.Record{
+		"A|" + domain: {
+			{ID: "rec-a", Type: "A", Name: domain, Content: "198.51.100.1"},
+			{ID: "rec-b", Type: "A", Name: domain, Content: "198.51.100.1"},
+		},
+	}}
+	det := &fakeIP{v4: "198.51.100.1"}
+	up := &updater.Updater{DomainV4: domain, IP: det, DNS: dns}
+
+	first, _ := up.Run(context.Background())
+	if !strings.Contains(first[0].Warning, "2 A records") {
+		t.Fatalf("first: %+v", first)
+	}
+	// Unchanged from cache, then a PATCH from cache: both are answered
+	// without a lookup, and both must still say the duplicate exists.
+	cached, _ := up.Run(context.Background())
+	det.v4 = "198.51.100.2"
+	patched, _ := up.Run(context.Background())
+	for _, r := range []updater.Result{cached[0], patched[0]} {
+		if r.Warning != first[0].Warning {
+			t.Fatalf("cached cycle lost the warning: %+v", r)
+		}
+	}
+	if cached[0].Action != updater.ActionUnchanged || patched[0].Action != updater.ActionUpdated || dns.findCalls != 1 {
+		t.Fatalf("cached=%+v patched=%+v find=%d", cached[0], patched[0], dns.findCalls)
+	}
+}
+
+// Two cfddns processes (the service's first cycle beside a manual -once, or
+// cron beside a daemon) can both see no record and both create one. Every
+// racer re-reads after creating and deletes its own record when a lower ID
+// exists, so they converge on one record without either knowing the other.
+func TestRun_CreateRaceDeletesOwnHigherDuplicate(t *testing.T) {
+	const domain = "home.example.com"
+	dns := &fakeDNS{zoneID: "zone-x"}
+	dns.afterCreate = func() {
+		other := cloudflare.Record{ID: "aaa-other", Type: "A", Name: domain, Content: "198.51.100.1"}
+		dns.records["A|"+domain] = append([]cloudflare.Record{other}, dns.records["A|"+domain]...)
+	}
+	det := &fakeIP{v4: "198.51.100.1"}
+	up := &updater.Updater{DomainV4: domain, IP: det, DNS: dns}
+
+	results, ok := up.Run(context.Background())
+	if !ok || results[0].Action != updater.ActionUnchanged || results[0].Warning != "" {
+		t.Fatalf("results=%+v ok=%v", results, ok)
+	}
+	if len(dns.deletes) != 1 || dns.deletes[0] != "new1" {
+		t.Fatalf("must delete exactly its own record: deletes=%v", dns.deletes)
+	}
+	if dns.findCalls != 2 {
+		t.Fatalf("expected the lookup before create and the re-read after: find=%d", dns.findCalls)
+	}
+	// The survivor is what the cache manages from now on.
+	det.v4 = "198.51.100.2"
+	results, _ = up.Run(context.Background())
+	if results[0].Action != updater.ActionUpdated || dns.findCalls != 2 {
+		t.Fatalf("after reconcile: %+v find=%d", results, dns.findCalls)
+	}
+	if len(dns.updates) != 1 || dns.updates[0] != (updateCall{zoneID: "zone-x", id: "aaa-other", content: "198.51.100.2"}) {
+		t.Fatalf("updates: %+v", dns.updates)
+	}
+}
+
+func TestRun_CreateRaceKeepsOwnLowerRecord(t *testing.T) {
+	const domain = "home.example.com"
+	dns := &fakeDNS{}
+	dns.afterCreate = func() {
+		dns.records["A|"+domain] = append(dns.records["A|"+domain], cloudflare.Record{ID: "zzz-other", Type: "A", Name: domain, Content: "198.51.100.1"})
+	}
+	up := &updater.Updater{DomainV4: domain, IP: &fakeIP{v4: "198.51.100.1"}, DNS: dns}
+
+	results, ok := up.Run(context.Background())
+	if !ok || results[0].Action != updater.ActionCreated {
+		t.Fatalf("results=%+v ok=%v", results, ok)
+	}
+	if len(dns.deletes) != 0 {
+		t.Fatalf("the lowest ID is never deleted: %v", dns.deletes)
+	}
+	// The sibling is still there at this instant; the result says so, like
+	// any other duplicate, and the sibling's own reconcile removes it.
+	if w := results[0].Warning; !strings.Contains(w, "2 A records") || !strings.Contains(w, "only new1") {
+		t.Fatalf("warning = %q", w)
+	}
+}
+
+func TestRun_CreateVerifyReadFailsStillCreated(t *testing.T) {
+	const domain = "home.example.com"
+	dns := &fakeDNS{findErrs: []error{nil, errors.New("cloudflare api: status 502")}}
+	up := &updater.Updater{DomainV4: domain, IP: &fakeIP{v4: "198.51.100.1"}, DNS: dns}
+
+	results, ok := up.Run(context.Background())
+	if !ok || results[0].Action != updater.ActionCreated {
+		t.Fatalf("the record exists, the cycle must say created: %+v ok=%v", results, ok)
+	}
+	if !strings.Contains(results[0].Warning, "status 502") {
+		t.Fatalf("the skipped duplicate check must be visible: %+v", results[0])
+	}
+	if len(dns.deletes) != 0 {
+		t.Fatalf("nothing may be deleted blind: %v", dns.deletes)
+	}
+	// Cached as usual: the next cycle needs no lookup.
+	if r, _ := up.Run(context.Background()); r[0].Action != updater.ActionUnchanged || dns.findCalls != 2 {
+		t.Fatalf("after create: %+v find=%d", r, dns.findCalls)
+	}
+}
+
+func TestRun_CreateVerifyReadEmptyStillCreated(t *testing.T) {
+	const domain = "home.example.com"
+	dns := &fakeDNS{}
+	dns.afterCreate = func() { dns.records = nil } // the read lags the write
+	up := &updater.Updater{DomainV4: domain, IP: &fakeIP{v4: "198.51.100.1"}, DNS: dns}
+
+	results, ok := up.Run(context.Background())
+	if !ok || results[0].Action != updater.ActionCreated || results[0].Warning != "" {
+		t.Fatalf("results=%+v ok=%v", results, ok)
+	}
+	if len(dns.deletes) != 0 {
+		t.Fatalf("deletes: %v", dns.deletes)
+	}
+	if r, _ := up.Run(context.Background()); r[0].Action != updater.ActionUnchanged || dns.findCalls != 2 {
+		t.Fatalf("after create: %+v find=%d", r, dns.findCalls)
+	}
+}
+
+// Observe is the hand-off for anything stateful downstream (the log
+// reporter). It runs inside the cycle lock, so observers see cycles in the
+// order they ran and never two at once; the plain slice append below is
+// only correct because of that, and -race proves it.
+func TestRun_ObserveRunsSerializedWithTheCycle(t *testing.T) {
+	const domain = "home.example.com"
+	dns := &fakeDNS{records: oneRecord(domain, "rec-a", "A", "198.51.100.1")}
+	var seen [][]updater.Result
+	up := &updater.Updater{DomainV4: domain, IP: &fakeIP{v4: "198.51.100.1"}, DNS: dns,
+		Observe: func(r []updater.Result) { seen = append(seen, r) }}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			up.Run(context.Background())
+		}()
+	}
+	wg.Wait()
+	if len(seen) != 20 {
+		t.Fatalf("observed %d cycles, want 20", len(seen))
+	}
+	for i, r := range seen {
+		if len(r) != 1 || r[0].Family != "ipv4" {
+			t.Fatalf("cycle %d: %+v", i, r)
+		}
+	}
+}
+
+func TestRun_ObserveSkipsLockWaitFailures(t *testing.T) {
+	const domain = "home.example.com"
+	block := make(chan struct{})
+	observed := 0
+	up := &updater.Updater{DomainV4: domain, IP: &fakeIP{v4: "198.51.100.1", block: block}, DNS: &fakeDNS{},
+		Observe: func([]updater.Result) { observed++ }}
+
+	done := make(chan struct{})
+	go func() {
+		up.Run(context.Background())
+		close(done)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if results, ok := up.Run(ctx); ok || results[0].Action != updater.ActionError {
+		t.Fatalf("waiter: %+v ok=%v", results, ok)
+	}
+	close(block)
+	<-done
+	// A waiter that gave up ran no cycle; only the blocked cycle is observed.
+	if observed != 1 {
+		t.Fatalf("observed %d, want 1", observed)
+	}
+}
+
+func TestRun_CreateRaceDeleteFailureIsReported(t *testing.T) {
+	const domain = "home.example.com"
+	dns := &fakeDNS{deleteErr: errors.New("cloudflare api: status 503")}
+	dns.afterCreate = func() {
+		other := cloudflare.Record{ID: "aaa-other", Type: "A", Name: domain, Content: "198.51.100.1"}
+		dns.records["A|"+domain] = append([]cloudflare.Record{other}, dns.records["A|"+domain]...)
+	}
+	up := &updater.Updater{DomainV4: domain, IP: &fakeIP{v4: "198.51.100.1"}, DNS: dns}
+
+	results, ok := up.Run(context.Background())
+	// Both records exist; the lowest is managed as for any duplicate, and
+	// the result says which one is ours and why it is still there.
+	if !ok || results[0].Action != updater.ActionUnchanged {
+		t.Fatalf("results=%+v ok=%v", results, ok)
+	}
+	w := results[0].Warning
+	for _, want := range []string{"new1", "aaa-other", "status 503", "only aaa-other is managed"} {
+		if !strings.Contains(w, want) {
+			t.Fatalf("warning %q lacks %q", w, want)
+		}
+	}
+	if len(dns.deletes) != 1 || dns.deletes[0] != "new1" {
+		t.Fatalf("deletes: %v", dns.deletes)
+	}
 }

@@ -258,8 +258,7 @@ func TestUninstall_SequenceAndRemoval(t *testing.T) {
 	if err := install.Install(sb, c, self, (&recorder{}).run); err != nil {
 		t.Fatal(err)
 	}
-	// stop failing (service not running) must not abort the uninstall.
-	rec := &recorder{fail: map[string]error{"systemctl stop cfddns": errors.New("not loaded")}}
+	rec := &recorder{}
 	if err := install.Uninstall(sb, rec.run); err != nil {
 		t.Fatal(err)
 	}
@@ -272,9 +271,81 @@ func TestUninstall_SequenceAndRemoval(t *testing.T) {
 	if strings.Join(rec.calls, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("calls %v want %v", rec.calls, want)
 	}
-	// Second uninstall with nothing left is still clean.
-	if err := install.Uninstall(sb, (&recorder{}).run); err != nil {
+	// Second uninstall with nothing left: the init system knows no service,
+	// so stop/disable failing is expected and the run is still clean.
+	again := &recorder{fail: map[string]error{
+		"systemctl stop cfddns":    errors.New("Unit cfddns.service not loaded."),
+		"systemctl disable cfddns": errors.New("Unit file cfddns.service does not exist."),
+	}}
+	if err := install.Uninstall(sb, again.run); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Removing the files under a service the init system could not stop leaves
+// a running process nobody manages and an operator who was told it is gone.
+func TestUninstall_StopFailureAbortsWhileServiceIsInstalled(t *testing.T) {
+	sb, self := sandbox(t, install.Systemd)
+	c := config.Config{DomainV4: "home.example.com", Token: "tok", Period: time.Minute}
+	if err := install.Install(sb, c, self, (&recorder{}).run); err != nil {
+		t.Fatal(err)
+	}
+	rec := &recorder{fail: map[string]error{"systemctl stop cfddns": errors.New("Job for cfddns.service canceled.")}}
+	err := install.Uninstall(sb, rec.run)
+	if err == nil || !strings.Contains(err.Error(), "canceled") {
+		t.Fatalf("err = %v, want the stop failure", err)
+	}
+	for _, p := range []string{sb.BinPath, sb.EnvPath, sb.ServicePath} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s must survive an aborted uninstall: %v", p, err)
+		}
+	}
+	if strings.Join(rec.calls, "\n") != "systemctl stop cfddns" {
+		t.Fatalf("must stop at the first failure: %v", rec.calls)
+	}
+}
+
+// Leftovers without a service definition (an earlier uninstall that failed
+// after removing it) are still removable even though stop/disable fail.
+func TestUninstall_WithoutServiceFileToleratesDeactivateFailures(t *testing.T) {
+	sb, self := sandbox(t, install.OpenRC)
+	c := config.Config{DomainV4: "home.example.com", Token: "tok", Period: time.Minute}
+	if err := install.Install(sb, c, self, (&recorder{}).run); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(sb.ServicePath); err != nil {
+		t.Fatal(err)
+	}
+	rec := &recorder{fail: map[string]error{
+		"rc-service cfddns stop":       errors.New("rc-service: service `cfddns' does not exist"),
+		"rc-update del cfddns default": errors.New("rc-update: service `cfddns' is not in the runlevel `default'"),
+	}}
+	if err := install.Uninstall(sb, rec.run); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{sb.BinPath, sb.EnvPath} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s still present", p)
+		}
+	}
+}
+
+func TestInstall_ReinstallRestoresEnvFileMode(t *testing.T) {
+	sb, self := sandbox(t, install.Systemd)
+	c := config.Config{DomainV4: "home.example.com", Token: "tok", Period: time.Minute}
+	if err := install.Install(sb, c, self, (&recorder{}).run); err != nil {
+		t.Fatal(err)
+	}
+	// The file holds the API token; whatever loosened it since the last
+	// install, the next install must leave it 0600 again.
+	if err := os.Chmod(sb.EnvPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := install.Install(sb, c, self, (&recorder{}).run); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(sb.EnvPath); st.Mode().Perm() != 0o600 {
+		t.Fatalf("reinstall must restore env mode, got %v", st.Mode())
 	}
 }
 

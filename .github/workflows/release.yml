@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (e.g. v0.1.0). Leave empty to build current ref without a GitHub Release."
+        description: "Existing tag to build and publish (e.g. v0.1.0); its source is what gets built. Leave empty to only test and build the current ref."
         required: false
         default: ""
 
@@ -15,75 +15,26 @@ permissions:
   contents: write
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Test (race)
-        run: go test -race -count=1 ./...
-
-  build:
-    name: Build ${{ matrix.asset }}
-    needs: test
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { asset: linux-amd64,  goos: linux, goarch: amd64 }
-          - { asset: linux-arm64,  goos: linux, goarch: arm64 }
-          - { asset: linux-armv7,  goos: linux, goarch: arm,    goarm: "7" }
-          - { asset: linux-armv6,  goos: linux, goarch: arm,    goarm: "6" }
-          - { asset: linux-mips,   goos: linux, goarch: mips,   gomips: softfloat }
-          - { asset: linux-mipsle, goos: linux, goarch: mipsle, gomips: softfloat }
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Build
-        env:
-          CGO_ENABLED: "0"
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm }}
-          GOMIPS: ${{ matrix.gomips }}
-        run: |
-          mkdir -p dist
-          out="dist/cfddns-${{ matrix.asset }}"
-          go build -trimpath -ldflags="-s -w" -o "$out" ./cmd/cfddns
-          chmod +x "$out"
-          ls -lh "$out"
-          file "$out" || true
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cfddns-${{ matrix.asset }}
-          path: dist/cfddns-${{ matrix.asset }}
-          if-no-files-found: error
+  # Test and build exactly as CI does, pinned to the tag being published: a
+  # manual dispatch from any branch with a tag input builds that tag's
+  # source, never the branch's, so the assets uploaded under the tag are the
+  # tag's.
+  ci:
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ inputs.tag || github.ref }}
 
   release:
     name: GitHub Release
-    needs: build
+    needs: ci
     runs-on: ubuntu-latest
     # Tag push, or manual dispatch with an explicit tag input.
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Resolve tag
         id: meta
@@ -126,17 +77,18 @@ jobs:
           | \`cfddns-linux-mipsle\` | MT7620/MT7621 (ramips) OpenWrt |
           | \`cfddns-linux-mips\` | ath79 / big-endian MIPS OpenWrt |
 
-          ### Install (auto-detects arch and init system: systemd, OpenRC, procd)
+          ### Install (auto-detects arch and init system: systemd, OpenRC, procd; verifies SHA256SUMS)
 
           \`\`\`sh
           wget -qO- https://raw.githubusercontent.com/${{ github.repository }}/${tag}/install.sh \\
             | sh -s -- -4 home.example.com -token "\$CF_TOKEN"
           \`\`\`
 
-          Verify: \`sha256sum -c SHA256SUMS\`
+          Manual download: verify with \`sha256sum -c SHA256SUMS\`
           EOF
           )"
-          # Soft-create: overwrite assets if re-running for same tag.
+          # Re-running for the same tag rebuilds the same source (the ref is
+          # pinned above) and replaces the assets.
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" dist/cfddns-linux-* dist/SHA256SUMS --clobber
           else

@@ -1,7 +1,8 @@
 #!/bin/sh
-# cfddns installer: picks the release asset for this machine, downloads it and
-# runs "cfddns -install" with every argument you pass. Works with busybox sh
-# (OpenWrt, Alpine) and bash. Must run as root.
+# cfddns installer: picks the release asset for this machine, downloads it,
+# checks it against the release's SHA256SUMS and runs "cfddns -install" with
+# every argument you pass. Works with busybox sh (OpenWrt, Alpine) and bash.
+# Must run as root.
 #
 #   wget -qO- https://raw.githubusercontent.com/xjetry/cfddns/main/install.sh \
 #     | sh -s -- -4 home.example.com -token "$CF_TOKEN"
@@ -42,20 +43,52 @@ fetch() { # url dest
 	fi
 }
 
+# The download lands in a directory that holds system binaries, never in
+# /tmp: /tmp is often mounted noexec on hardened hosts, where running the
+# binary from it fails after the download, and it is world-writable, where a
+# predictable name could be pre-placed as a symlink by any local user. These
+# directories are executable by definition and writable by root only.
+workdir() {
+	for d in /usr/local/bin /usr/bin; do
+		if [ -d "$d" ] && [ -w "$d" ]; then
+			echo "$d"
+			return
+		fi
+	done
+	die "no writable binary directory (/usr/local/bin or /usr/bin)"
+}
+
 [ "$(id -u)" = 0 ] || die "run as root (sudo)"
 [ $# -gt 0 ] || die "pass the cfddns -install flags, e.g.: -4 home.example.com -token XXX"
 
-asset="${CFDDNS_ASSET:-$(detect_asset)}"
-if [ "$VERSION" = latest ]; then
-	url="https://github.com/$REPO/releases/latest/download/cfddns-linux-$asset"
+if command -v sha256sum >/dev/null 2>&1; then
+	sha256="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+	sha256="shasum -a 256"
 else
-	url="https://github.com/$REPO/releases/download/$VERSION/cfddns-linux-$asset"
+	die "need sha256sum or shasum to verify the download"
 fi
 
-tmp="$(mktemp 2>/dev/null || echo "/tmp/cfddns.$$")"
-trap 'rm -f "$tmp"' EXIT
+asset="${CFDDNS_ASSET:-$(detect_asset)}"
+if [ "$VERSION" = latest ]; then
+	base="https://github.com/$REPO/releases/latest/download"
+else
+	base="https://github.com/$REPO/releases/download/$VERSION"
+fi
 
-echo "downloading $url"
-fetch "$url" "$tmp"
+dir="$(workdir)"
+tmp="$(mktemp "$dir/.cfddns-install.XXXXXX" 2>/dev/null || echo "$dir/.cfddns-install.$$")"
+sums="$tmp.sha256"
+trap 'rm -f "$tmp" "$sums"' EXIT
+
+echo "downloading $base/cfddns-linux-$asset"
+fetch "$base/cfddns-linux-$asset" "$tmp"
+fetch "$base/SHA256SUMS" "$sums"
+# SHA256SUMS lines read "<hash>  cfddns-linux-<asset>"; anchor the name so
+# "mips" cannot match "mipsle".
+want="$(grep "[[:space:]]cfddns-linux-$asset\$" "$sums" | cut -d' ' -f1 || true)"
+[ -n "$want" ] || die "cfddns-linux-$asset is not listed in SHA256SUMS"
+got="$($sha256 "$tmp" | cut -d' ' -f1)"
+[ "$got" = "$want" ] || die "checksum mismatch for cfddns-linux-$asset: got $got, want $want"
 chmod +x "$tmp"
 "$tmp" -install "$@"

@@ -3,6 +3,7 @@ package config_test
 import (
 	"errors"
 	"flag"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,10 +13,16 @@ import (
 	"cfddns/internal/config"
 )
 
+// clearEnv removes every CFDDNS_* key from the process environment for the
+// test's duration. Unsetting, not blanking: a present-but-empty key is a
+// value in its own right (it clears what the env file set).
 func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{"CFDDNS_V4", "CFDDNS_V6", "CFDDNS_V6_IFACE", "CFDDNS_TOKEN", "CFDDNS_PERIOD", "CFDDNS_PORT", "CFDDNS_PASSWD"} {
-		t.Setenv(k, "")
+		if v, ok := os.LookupEnv(k); ok {
+			t.Cleanup(func() { os.Setenv(k, v) })
+			os.Unsetenv(k)
+		}
 	}
 }
 
@@ -196,7 +203,7 @@ func TestLoad_FlagsOverrideEnvFileAndOSEnv(t *testing.T) {
 	t.Setenv("CFDDNS_PORT", "9090")
 	path := writeEnv(t, "CFDDNS_V4=file.example.com\nCFDDNS_TOKEN=from-file\nCFDDNS_PERIOD=2m\nCFDDNS_PORT=8080\nCFDDNS_PASSWD=filepw\n")
 
-	c, err := config.LoadFrom(path, []string{"-period", "1m"})
+	c, err := config.LoadFrom(path, []string{"-period", "1m"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +227,7 @@ func TestLoad_FlagsOverrideEnvFileAndOSEnv(t *testing.T) {
 func TestLoad_ExplicitEmptyFlagClearsEnvValue(t *testing.T) {
 	clearEnv(t)
 	path := writeEnv(t, "CFDDNS_V4=a.example.com\nCFDDNS_V6=b.example.com\nCFDDNS_TOKEN=t\n")
-	c, err := config.LoadFrom(path, []string{"-6", ""})
+	c, err := config.LoadFrom(path, []string{"-6", ""}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +241,7 @@ func TestLoad_ExplicitEmptyFlagClearsEnvValue(t *testing.T) {
 
 func TestLoad_NormalizesDomains(t *testing.T) {
 	clearEnv(t)
-	c, err := config.LoadFrom(filepath.Join(t.TempDir(), "missing.env"), []string{"-4", "Home.Example.COM.", "-6", " V6.Example.com ", "-token", "x"})
+	c, err := config.LoadFrom(filepath.Join(t.TempDir(), "missing.env"), []string{"-4", "Home.Example.COM.", "-6", " V6.Example.com ", "-token", "x"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +256,7 @@ func TestLoad_NormalizesDomains(t *testing.T) {
 func TestLoad_InstallIgnoresEnvFile(t *testing.T) {
 	clearEnv(t)
 	path := writeEnv(t, "CFDDNS_V4=old.example.com\nCFDDNS_V6=old6.example.com\nCFDDNS_TOKEN=old\nCFDDNS_PORT=8080\nCFDDNS_PASSWD=oldpw\n")
-	c, err := config.LoadFrom(path, []string{"-install", "-4", "new.example.com", "-token", "new"})
+	c, err := config.LoadFrom(path, []string{"-install", "-4", "new.example.com", "-token", "new"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,10 +274,10 @@ func TestLoad_InstallIgnoresEnvFile(t *testing.T) {
 func TestLoad_UninstallIgnoresCorruptEnvFile(t *testing.T) {
 	clearEnv(t)
 	path := writeEnv(t, "CFDDNS_PASSWD=\"quoted is not allowed\"\n")
-	if _, err := config.LoadFrom(path, nil); err == nil {
+	if _, err := config.LoadFrom(path, nil, io.Discard); err == nil {
 		t.Fatal("run mode must reject a corrupt env file")
 	}
-	c, err := config.LoadFrom(path, []string{"-uninstall"})
+	c, err := config.LoadFrom(path, []string{"-uninstall"}, io.Discard)
 	if err != nil {
 		t.Fatalf("uninstall must not read the env file: %v", err)
 	}
@@ -281,7 +288,7 @@ func TestLoad_UninstallIgnoresCorruptEnvFile(t *testing.T) {
 
 func TestLoad_MissingOrUnreadableEnvFileIsSkipped(t *testing.T) {
 	clearEnv(t)
-	c, err := config.LoadFrom(filepath.Join(t.TempDir(), "missing.env"), []string{"-4", "a.example.com", "-token", "x"})
+	c, err := config.LoadFrom(filepath.Join(t.TempDir(), "missing.env"), []string{"-4", "a.example.com", "-token", "x"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,6 +377,7 @@ func TestUsage_ContainsFlagsAndLogs(t *testing.T) {
 		"[required]",
 		"[optional",
 		"CFDDNS_V6_IFACE",
+		"RFC 4941",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("Usage missing %q", want)
@@ -377,9 +385,71 @@ func TestUsage_ContainsFlagsAndLogs(t *testing.T) {
 	}
 }
 
-func TestLoad_HelpReturnsErrHelp(t *testing.T) {
-	_, err := config.Load([]string{"-h"})
+func TestLoad_RejectsPositionalArguments(t *testing.T) {
+	clearEnv(t)
+	// flag.Parse stops at the first non-flag word, so without this check
+	// "-once" after "extra" would be dropped and the command would run as a
+	// daemon.
+	_, err := config.LoadFrom(filepath.Join(t.TempDir(), "missing.env"), []string{"-4", "h.example.com", "-token", "x", "extra", "-once"}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), `"extra"`) {
+		t.Fatalf("err = %v, want an error naming the stray argument", err)
+	}
+}
+
+func TestLoad_HelpAndFlagErrorsPrintOnce(t *testing.T) {
+	clearEnv(t)
+	path := filepath.Join(t.TempDir(), "missing.env")
+	var usage strings.Builder
+	_, err := config.LoadFrom(path, []string{"-h"}, &usage)
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("got %v, want flag.ErrHelp", err)
+	}
+	if !strings.Contains(usage.String(), "Usage:") {
+		t.Fatalf("-h must write the usage text to the given writer, got %q", usage.String())
+	}
+
+	// A flag error is returned for the caller to print once; nothing is
+	// written here (the flag package's own copy of the message and usage
+	// dump are suppressed).
+	var out strings.Builder
+	_, err = config.LoadFrom(path, []string{"-bogus"}, &out)
+	if err == nil || !strings.Contains(err.Error(), "-bogus") || !strings.Contains(err.Error(), "-h") {
+		t.Fatalf("err = %v, want the flag error with a pointer to -h", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("flag error must not write usage: %q", out.String())
+	}
+}
+
+func TestLoad_EmptyProcessEnvClearsEnvFileValue(t *testing.T) {
+	clearEnv(t)
+	path := writeEnv(t, "CFDDNS_V4=a.example.com\nCFDDNS_V6=b.example.com\nCFDDNS_TOKEN=t\nCFDDNS_PERIOD=2m\nCFDDNS_PORT=8080\nCFDDNS_PASSWD=pw\n")
+	// Present keys override lower layers, whatever their value: an empty
+	// value clears what the file set, back to the default.
+	t.Setenv("CFDDNS_V6", "")
+	t.Setenv("CFDDNS_PERIOD", "")
+	t.Setenv("CFDDNS_PORT", "")
+	t.Setenv("CFDDNS_PASSWD", "")
+	c, err := config.LoadFrom(path, nil, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.DomainV6 != "" || c.Port != 0 || c.Passwd != "" || c.Period != config.DefaultPeriod {
+		t.Fatalf("empty process env must clear file values: %+v", c)
+	}
+	if c.DomainV4 != "a.example.com" || c.Token != "t" {
+		t.Fatalf("untouched keys must survive: %+v", c)
+	}
+}
+
+func TestLoad_UninstallIgnoresProcessEnv(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("CFDDNS_PERIOD", "not-a-duration")
+	c, err := config.LoadFrom(filepath.Join(t.TempDir(), "missing.env"), []string{"-uninstall"}, io.Discard)
+	if err != nil {
+		t.Fatalf("uninstall needs no configuration and must not fail on it: %v", err)
+	}
+	if !c.Uninstall {
+		t.Fatal("Uninstall not set")
 	}
 }

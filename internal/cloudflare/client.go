@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,6 +42,27 @@ type Record struct {
 type apiError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+}
+
+// APIError is an answer whose envelope says success=false. Status is the
+// HTTP status it arrived with; callers classify by that (IsNotFound) and not
+// by Cloudflare's numeric codes, which differ per endpoint for the same
+// condition.
+type APIError struct {
+	Status int
+	errors []apiError
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("cloudflare api: status %d: %s", e.Status, formatAPIErrors(e.errors))
+}
+
+// IsNotFound reports whether err says the addressed zone or record does not
+// exist (HTTP 404 from the API). A transport failure, a rate limit or an
+// auth error is never not-found: the object may well still be there.
+func IsNotFound(err error) bool {
+	var e *APIError
+	return errors.As(err, &e) && e.Status == http.StatusNotFound
 }
 
 type apiEnvelope struct {
@@ -164,21 +186,35 @@ func isZoneMatch(fqdn, zone string) bool {
 }
 
 // FindRecords returns every DNS record in the zone matching type and name,
-// in API order. An empty slice means the record does not exist.
+// in API order, following pagination so a name with more records than one
+// page holds is still seen whole (the updater picks the lowest ID of the
+// full set). An empty slice means the record does not exist.
 func (c *Client) FindRecords(ctx context.Context, zoneID, typ, name string) ([]Record, error) {
-	q := url.Values{}
-	q.Set("type", typ)
-	q.Set("name", name)
-	q.Set("per_page", "100")
-	path := fmt.Sprintf("/zones/%s/dns_records?%s", url.PathEscape(zoneID), q.Encode())
+	var records []Record
+	page := 1
+	for {
+		q := url.Values{}
+		q.Set("type", typ)
+		q.Set("name", name)
+		q.Set("per_page", "100")
+		q.Set("page", strconv.Itoa(page))
+		path := fmt.Sprintf("/zones/%s/dns_records?%s", url.PathEscape(zoneID), q.Encode())
 
-	var results []recordResult
-	if _, err := c.do(ctx, http.MethodGet, path, nil, &results); err != nil {
-		return nil, err
+		var results []recordResult
+		info, err := c.do(ctx, http.MethodGet, path, nil, &results)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range results {
+			records = append(records, r.record())
+		}
+		if info == nil || page >= info.TotalPages || len(results) == 0 {
+			break
+		}
+		page++
 	}
-	records := make([]Record, 0, len(results))
-	for _, r := range results {
-		records = append(records, r.record())
+	if records == nil {
+		records = []Record{}
 	}
 	return records, nil
 }
@@ -213,6 +249,14 @@ func (c *Client) UpdateRecordContent(ctx context.Context, zoneID, recordID, cont
 	}{Content: content}
 	path := fmt.Sprintf("/zones/%s/dns_records/%s", url.PathEscape(zoneID), url.PathEscape(recordID))
 	_, err := c.do(ctx, http.MethodPatch, path, body, nil)
+	return err
+}
+
+// DeleteRecord removes one record. The updater calls it only on a record this
+// process itself created moments earlier and found to be a duplicate.
+func (c *Client) DeleteRecord(ctx context.Context, zoneID, recordID string) error {
+	path := fmt.Sprintf("/zones/%s/dns_records/%s", url.PathEscape(zoneID), url.PathEscape(recordID))
+	_, err := c.do(ctx, http.MethodDelete, path, nil, nil)
 	return err
 }
 
@@ -252,7 +296,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, dest any
 		return nil, fmt.Errorf("cloudflare api: status %d: invalid json: %w", resp.StatusCode, err)
 	}
 	if !env.Success {
-		return nil, fmt.Errorf("cloudflare api: %s", formatAPIErrors(env.Errors))
+		return nil, &APIError{Status: resp.StatusCode, errors: env.Errors}
 	}
 	if dest != nil && len(env.Result) > 0 && string(env.Result) != "null" {
 		if err := json.Unmarshal(env.Result, dest); err != nil {

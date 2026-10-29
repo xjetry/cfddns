@@ -1,14 +1,16 @@
 // Package envfile reads and writes the KEY=value file persisted by -install.
 //
-// The same file is consumed by two independent parsers: this package (for
-// -once and daemon runs outside systemd) and systemd's EnvironmentFile= (for
-// the installed unit). Both must yield identical values. systemd implements
-// shell-like quoting and backslash escapes that are not reimplemented here;
-// instead the grammar is restricted to the subset on which the two parsers
-// trivially agree: one KEY=value per line, value made only of printable ASCII
-// without whitespace, quotes, backslash, '#' or ';'. Encode refuses any other
-// value and Parse refuses any other line, so a value can never be read one way
-// by cfddns and another way by systemd.
+// cfddns is the file's only parser (every init system starts the bare
+// binary, which reads the file itself), and the grammar is a documented
+// contract with the operator: one KEY=value per line, the value made only of
+// printable ASCII without whitespace, quotes, backslash, '#' or ';'. The
+// restriction keeps the file unambiguous for a human editing it and for any
+// shell-style reader an operator may point at it ("set -a; . /etc/cfddns.env",
+// "env $(cat ...)"), since every such reader agrees with cfddns on a value
+// that contains none of the characters they treat specially. Encode refuses
+// any other value and Parse refuses any other line, so what -install writes
+// from the command line reads back identically, and a hand edit that would
+// read differently somewhere is an error here instead of a surprise.
 package envfile
 
 import (

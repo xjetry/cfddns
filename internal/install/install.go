@@ -6,6 +6,7 @@
 package install
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
 	"cfddns/internal/config"
 )
@@ -22,9 +25,34 @@ const ServiceName = "cfddns"
 // Runner executes one host command; Exec is the production implementation.
 type Runner func(name string, args ...string) error
 
-// Exec runs the command and folds its output into the error on failure.
+// ExecTimeout bounds one init-system command. systemd itself gives a unit
+// 90s to stop (DefaultTimeoutStopSec) and a restart is a stop plus a start,
+// so the bound sits above that: it exists for a control command that hangs
+// outright (a wedged init, a blocked D-Bus), not for a slow but working one.
+const ExecTimeout = 3 * time.Minute
+
+// Exec runs the command within ExecTimeout and folds its output into the
+// error on failure.
 func Exec(name string, args ...string) error {
-	out, err := exec.Command(name, args...).CombinedOutput()
+	return runWithin(ExecTimeout, name, args...)
+}
+
+func runWithin(timeout time.Duration, name string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	// Init commands fork helpers (rc-service → openrc-run.sh →
+	// supervise-daemon) that inherit the output pipe, and the wait only ends
+	// when every holder of that pipe is gone. The command therefore gets its
+	// own process group, which the deadline kills as a whole, and WaitDelay
+	// closes the pipe should a helper have escaped the group.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("%s %s: timed out after %s: %s", name, strings.Join(args, " "), timeout, strings.TrimSpace(string(out)))
+	}
 	if err != nil {
 		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
@@ -46,8 +74,9 @@ type System struct {
 	// for an already running service, which would leave a reinstall running
 	// the old binary with the old configuration.
 	activate [][]string
-	// deactivate runs before files are removed; failures are ignored because
-	// the service may not be running or registered.
+	// deactivate runs before files are removed: stop, then unregister from
+	// boot. A failure aborts the uninstall while the service definition is
+	// still installed (see Uninstall).
 	deactivate [][]string
 	// cleanup runs after files are removed.
 	cleanup [][]string
@@ -235,16 +264,13 @@ func Install(sys *System, c config.Config, selfPath string, run Runner) error {
 	if err := copyFile(selfPath, sys.BinPath, 0o755); err != nil {
 		return fmt.Errorf("install binary: %w", err)
 	}
-	if err := os.WriteFile(sys.EnvPath, []byte(env), 0o600); err != nil {
+	// The env file holds the API token: 0600 and root-owned on every
+	// install, whatever a previous install or a hand edit left behind.
+	if err := replaceFile(sys.EnvPath, 0o600, writeString(env)); err != nil {
 		return fmt.Errorf("write env: %w", err)
 	}
-	if err := os.WriteFile(sys.ServicePath, []byte(sys.Service()), sys.ServiceMode); err != nil {
+	if err := replaceFile(sys.ServicePath, sys.ServiceMode, writeString(sys.Service())); err != nil {
 		return fmt.Errorf("write service: %w", err)
-	}
-	// WriteFile only applies the mode on creation; a reinstall over an
-	// existing file must still end up executable where the init needs it.
-	if err := os.Chmod(sys.ServicePath, sys.ServiceMode); err != nil {
-		return fmt.Errorf("chmod service: %w", err)
 	}
 	for _, cmd := range sys.activate {
 		if err := run(cmd[0], cmd[1:]...); err != nil {
@@ -254,10 +280,21 @@ func Install(sys *System, c config.Config, selfPath string, run Runner) error {
 	return nil
 }
 
-// Uninstall stops and unregisters the service, then removes service, env and binary.
+// Uninstall stops and unregisters the service, then removes service, env and
+// binary. While the service definition is installed the init system knows
+// the service, so a stop or disable that fails aborts before any file goes:
+// removing the files under a service that could not be stopped would leave
+// a process no init system manages, reported as "uninstalled". Once the
+// definition is gone (an earlier uninstall that got that far) stop and
+// disable can only answer "no such service", and the leftovers are removed
+// regardless.
 func Uninstall(sys *System, run Runner) error {
+	_, err := os.Stat(sys.ServicePath)
+	installed := err == nil
 	for _, cmd := range sys.deactivate {
-		_ = run(cmd[0], cmd[1:]...)
+		if err := run(cmd[0], cmd[1:]...); err != nil && installed {
+			return err
+		}
 	}
 	for _, p := range []string{sys.ServicePath, sys.EnvPath, sys.BinPath} {
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
@@ -272,21 +309,37 @@ func Uninstall(sys *System, run Runner) error {
 	return nil
 }
 
-// copyFile writes src to dst with mode via a temp file in the same directory
-// so the binary replace is atomic and a running instance keeps its old inode
-// until the init system restarts it.
+// copyFile writes src to dst with mode through replaceFile.
 func copyFile(src, dst string, mode os.FileMode) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
+	return replaceFile(dst, mode, func(w io.Writer) error {
+		_, err := io.Copy(w, in)
+		return err
+	})
+}
 
+func writeString(s string) func(io.Writer) error {
+	return func(w io.Writer) error {
+		_, err := io.WriteString(w, s)
+		return err
+	}
+}
+
+// replaceFile writes dst atomically: content fills a temp file in the same
+// directory, which is given mode and renamed over dst. The result is a new
+// inode carrying mode and this process's ownership whatever dst was before,
+// so a reinstall over a loosened or foreign-owned file never inherits it; a
+// crash mid-write leaves the old file intact; and a running binary keeps its
+// old inode until the init system restarts it.
+func replaceFile(dst string, mode os.FileMode, content func(io.Writer) error) error {
 	dir := filepath.Dir(dst)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-
 	tmp, err := os.CreateTemp(dir, ".cfddns-install-*")
 	if err != nil {
 		return err
@@ -299,7 +352,7 @@ func copyFile(src, dst string, mode os.FileMode) error {
 		}
 	}()
 
-	if _, err := io.Copy(tmp, in); err != nil {
+	if err := content(tmp); err != nil {
 		tmp.Close()
 		return err
 	}

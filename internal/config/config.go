@@ -20,6 +20,13 @@ const (
 	// count against the token's 1200 requests / 5 min limit.
 	MinPeriod      = 10 * time.Second
 	DefaultEnvPath = "/etc/cfddns.env"
+	// ErrorRepeatEvery is how many consecutive cycles with the same error
+	// pass between two log lines for it; the reporter in cmd/cfddns applies
+	// it and the help text quotes it. An OpenRC host logs to a plain file
+	// that nothing rotates, so a failure lasting weeks must cost a bounded
+	// number of lines while still showing it is ongoing. 12 is one hour at
+	// the default period.
+	ErrorRepeatEvery = 12
 )
 
 // Persisted environment keys. This table is the only place the key names
@@ -65,44 +72,55 @@ func ParseEnvFile(path string) (map[string]string, error) {
 	return envfile.Parse(f)
 }
 
-// ApplyEnvMap sets fields from CFDDNS_* keys (only non-empty keys).
+// ApplyEnvMap sets fields from the CFDDNS_* keys present in m. Presence is
+// what counts, not the value: a key set to the empty string clears the field
+// back to its default, so a higher layer (process env over env file) can
+// undo what a lower one set, the same way an explicit empty flag does.
 func (c *Config) ApplyEnvMap(m map[string]string) error {
-	if v := m[EnvV4]; v != "" {
+	if v, ok := m[EnvV4]; ok {
 		c.DomainV4 = v
 	}
-	if v := m[EnvV6]; v != "" {
+	if v, ok := m[EnvV6]; ok {
 		c.DomainV6 = v
 	}
-	if v := m[EnvV6Iface]; v != "" {
+	if v, ok := m[EnvV6Iface]; ok {
 		c.V6Iface = v
 	}
-	if v := m[EnvToken]; v != "" {
+	if v, ok := m[EnvToken]; ok {
 		c.Token = v
 	}
-	if v := m[EnvPeriod]; v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return fmt.Errorf("%s: %w", EnvPeriod, err)
+	if v, ok := m[EnvPeriod]; ok {
+		c.Period = DefaultPeriod
+		if v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return fmt.Errorf("%s: %w", EnvPeriod, err)
+			}
+			c.Period = d
 		}
-		c.Period = d
 	}
-	if v := m[EnvPort]; v != "" {
-		p, err := strconv.Atoi(v)
-		if err != nil {
-			return fmt.Errorf("%s: %w", EnvPort, err)
+	if v, ok := m[EnvPort]; ok {
+		c.Port = 0
+		if v != "" {
+			p, err := strconv.Atoi(v)
+			if err != nil {
+				return fmt.Errorf("%s: %w", EnvPort, err)
+			}
+			c.Port = p
 		}
-		c.Port = p
 	}
-	if v := m[EnvPasswd]; v != "" {
+	if v, ok := m[EnvPasswd]; ok {
 		c.Passwd = v
 	}
 	return nil
 }
 
+// ApplyOSEnv applies the CFDDNS_* keys set in the process environment,
+// including those set to an empty value (see ApplyEnvMap).
 func (c *Config) ApplyOSEnv() error {
 	m := map[string]string{}
 	for _, k := range envKeys {
-		if v := os.Getenv(k); v != "" {
+		if v, ok := os.LookupEnv(k); ok {
 			m[k] = v
 		}
 	}
@@ -154,7 +172,11 @@ Flags:
         [optional*] IPv6 FQDN → Cloudflare AAAA record (env %[4]s)
   -6-iface string
         [optional]  prefer the stable global IPv6 of this interface for -6;
-                    falls back to trace when none is found (env %[5]s)
+                    falls back to trace when none is found (env %[5]s).
+                    Without it the AAAA follows the source address the kernel
+                    picks for outgoing connections, which with privacy
+                    extensions (RFC 4941) is a temporary address that rotates
+                    about daily
   -token string
         [required]  Cloudflare API Token; Zone:DNS:Edit + Zone:Zone:Read (env %[6]s)
   -period duration
@@ -178,9 +200,12 @@ Flags:
 * At least one of -4 or -6 is required for daemon, -once, and -install.
 
 Rules:
-  - Config merge for daemon/-once: defaults → %[2]s → process env → CLI flags
+  - Config merge for daemon/-once: defaults → %[2]s → process env → CLI flags;
+    a key that is present but empty clears the lower layer's value
   - -install persists exactly process env + CLI flags; it never merges an
     existing %[2]s, so re-running -install replaces the old configuration
+  - -uninstall reads no configuration at all
+  - Flags only: a stray word on the command line is an error, not ignored
   - Domains are lower-cased and must be RFC 1123 host names (use punycode for IDN)
   - Values in %[2]s are bare KEY=value: printable ASCII without whitespace,
     quotes, backslash, '#' or ';' (so -passwd/-token must fit that too)
@@ -199,7 +224,8 @@ Service logs (after -install):
   systemd:  journalctl -u cfddns -f
             journalctl -u cfddns -n 100 --no-pager
             journalctl -u cfddns --since "1 hour ago"
-  OpenRC:   tail -f /var/log/cfddns.log
+  OpenRC:   tail -f /var/log/cfddns.log   (not rotated by cfddns; a lasting
+            failure is logged once, then every %[11]d cycles)
   procd:    logread -e cfddns -f
 
 Examples:
@@ -210,12 +236,13 @@ Examples:
   sudo cfddns -once
   sudo cfddns -uninstall
 
-`, DefaultPeriod, DefaultEnvPath, EnvV4, EnvV6, EnvV6Iface, EnvToken, MinPeriod, EnvPeriod, EnvPort, EnvPasswd)
+`, DefaultPeriod, DefaultEnvPath, EnvV4, EnvV6, EnvV6Iface, EnvToken, MinPeriod, EnvPeriod, EnvPort, EnvPasswd, ErrorRepeatEvery)
 }
 
-// Load is LoadFrom with the production env file path.
+// Load is LoadFrom with the production env file path; -h output goes to
+// stdout.
 func Load(args []string) (Config, error) {
-	return LoadFrom(DefaultEnvPath, args)
+	return LoadFrom(DefaultEnvPath, args, os.Stdout)
 }
 
 // LoadFrom merges configuration layers, higher wins:
@@ -225,15 +252,18 @@ func Load(args []string) (Config, error) {
 // persist exactly what the operator passes now, otherwise keys from a previous
 // install (an old -6, -port, -passwd) would silently survive a reconfigure.
 // -uninstall needs no configuration and must not fail on a corrupt file it is
-// about to delete.
+// about to delete, nor on a stray CFDDNS_* value in its environment, so it
+// also skips the process env layer.
 //
-// Passing -h/-help returns flag.ErrHelp after printing Usage (caller exits 0).
-func LoadFrom(envPath string, args []string) (Config, error) {
+// -h/-help writes Usage to usage and returns flag.ErrHelp (caller exits 0).
+// Any other parse error is returned once, for the caller to print; the flag
+// package's own copy of the message and its usage dump are suppressed.
+func LoadFrom(envPath string, args []string, usage io.Writer) (Config, error) {
 	c := Config{Period: DefaultPeriod}
 
 	fs := flag.NewFlagSet("cfddns", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	fs.Usage = func() { Usage(fs.Output()) }
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() {}
 
 	var fl Config
 	fs.StringVar(&fl.DomainV4, "4", "", "IPv4 FQDN → A record")
@@ -248,7 +278,16 @@ func LoadFrom(envPath string, args []string) (Config, error) {
 	fs.BoolVar(&fl.Uninstall, "uninstall", false, "uninstall service (root)")
 	fs.StringVar(&fl.Init, "init", "", "init system: systemd|openrc|procd")
 	if err := fs.Parse(args); err != nil {
-		return c, err
+		if errors.Is(err, flag.ErrHelp) {
+			Usage(usage)
+			return c, err
+		}
+		return c, fmt.Errorf("%w (see cfddns -h)", err)
+	}
+	// flag.Parse stops at the first non-flag word and leaves the rest
+	// unread, so "cfddns -4 h.example.com x -once" would run as a daemon.
+	if fs.NArg() > 0 {
+		return c, fmt.Errorf("unexpected argument %q: cfddns takes flags only (see cfddns -h)", fs.Arg(0))
 	}
 	set := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
@@ -268,8 +307,10 @@ func LoadFrom(envPath string, args []string) (Config, error) {
 			return c, fmt.Errorf("%s: %w", envPath, err)
 		}
 	}
-	if err := c.ApplyOSEnv(); err != nil {
-		return c, err
+	if !c.Uninstall {
+		if err := c.ApplyOSEnv(); err != nil {
+			return c, err
+		}
 	}
 
 	// Only flags the operator actually typed override lower layers, so an

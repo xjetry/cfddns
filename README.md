@@ -16,7 +16,7 @@ Cloudflare DDNS：把本机公网 IPv4 / IPv6 同步到 Cloudflare A / AAAA 记�
 ## 一键安装
 
 > 需要 root。先准备 [API Token](#cloudflare-api-token)（`Zone:DNS:Edit` + `Zone:Zone:Read`）。
-> `install.sh` 会识别 CPU 架构与 init 系统，下载 **latest** 二进制并执行 `cfddns -install`，服务随即启动并开机自启。
+> `install.sh` 会识别 CPU 架构与 init 系统，下载 **latest** 二进制、按 Release 的 `SHA256SUMS` 校验后执行 `cfddns -install`，服务随即启动并开机自启。下载落在 `/usr/local/bin`（或 `/usr/bin`）而不是 `/tmp`，所以 `/tmp` 挂成 `noexec` 也不影响；需要 `curl` 或 `wget`，以及 `sha256sum`。
 
 只更新 IPv4（把域名和 token 换成你的）：
 
@@ -65,7 +65,7 @@ wget -O /tmp/cfddns https://github.com/xjetry/cfddns/releases/latest/download/cf
   && sudo /tmp/cfddns -install -4 home.example.com -token 'YOUR_CF_TOKEN'
 ```
 
-校验：从 Release 下载 `SHA256SUMS` 后 `sha256sum -c SHA256SUMS`。
+校验：从 Release 下载 `SHA256SUMS` 后 `sha256sum -c SHA256SUMS`（`install.sh` 自动做这一步）。
 
 ### 安装结果
 
@@ -77,9 +77,11 @@ wget -O /tmp/cfddns https://github.com/xjetry/cfddns/releases/latest/download/cf
 
 三种 init 都只负责拉起裸二进制，配置由 cfddns 自己读 `/etc/cfddns.env`。init 系统自动识别；识别不对时加 `-init systemd|openrc|procd`。
 
+OpenRC 的 `/var/log/cfddns.log` 由 supervise-daemon 直接写文件，cfddns 不做轮转；稳态不产生日志，持续失败时同一错误只在出现时打一次、之后每 12 轮打一次，所以文件增长有界。需要更严格的控制可自行配 logrotate。
+
 ### 升级 / 改配置
 
-重新执行同一条安装命令即可。`-install` 不读取旧的 `/etc/cfddns.env`，写入的就是这次传的参数，然后自动 restart 服务，新二进制和新配置立即生效。
+重新执行同一条安装命令即可。`-install` 不读取旧的 `/etc/cfddns.env`，写入的就是这次传的参数，然后自动 restart 服务，新二进制和新配置立即生效。三个文件都是先写临时文件再原子替换，所以重装会把 `/etc/cfddns.env` 恢复成 `0600` root 所有，不继承之前被改松的权限。
 
 只改配置：编辑 `/etc/cfddns.env` 后重启：
 
@@ -95,11 +97,17 @@ sudo rc-service cfddns restart       # OpenRC
 sudo cfddns -uninstall
 ```
 
+停服务或取消自启失败时卸载会中止、不删文件，以免留下一个没人管的进程却报告"已卸载"；只有服务定义已经不在（上一次卸载中途失败）时才忽略这类错误直接清理残留。
+
 ### 装完后手动触发一轮
+
+服务启动时已经立刻跑过一轮，通常不必再手动触发。要手动跑：
 
 ```sh
 sudo cfddns -once
 ```
+
+和正在运行的服务同时跑是安全的：记录不存在时两边都可能去创建，cfddns 创建后会复读一次，发现并发产生的同名记录时删掉自己刚建的那条、只保留 ID 最小的一条。
 
 HTTP（若装时开了 `-port` / `-passwd`）：
 
@@ -132,7 +140,7 @@ cfddns -h
 |------|----------|------|------|
 | `-4` | `CFDDNS_V4` | — | IPv4 域名（A） |
 | `-6` | `CFDDNS_V6` | — | IPv6 域名（AAAA） |
-| `-6-iface` | `CFDDNS_V6_IFACE` | — | 优先用该网卡的稳定全局 IPv6；取不到回退 trace |
+| `-6-iface` | `CFDDNS_V6_IFACE` | — | 优先用该网卡的稳定全局 IPv6；取不到回退 trace。不指定时 AAAA 跟随内核选的出口源地址，开了隐私扩展（RFC 4941）的系统上那是每天轮换的临时地址 |
 | `-token` | `CFDDNS_TOKEN` | — | **必填** Cloudflare API Token |
 | `-period` | `CFDDNS_PERIOD` | `5m` | 更新周期，最小 `10s` |
 | `-port` | `CFDDNS_PORT` | 不开启 | HTTP 端口 |
@@ -146,8 +154,9 @@ cfddns -h
 
 - `-4` / `-6` **至少一个**；域名统一转小写，须是 RFC 1123 主机名（IDN 用 punycode）
 - 开了 `-port` 必须带 `-passwd`
-- daemon / `-once` 的配置合并：defaults → `/etc/cfddns.env` → 进程环境变量 → CLI
-- `-install` 只认进程环境变量 + CLI，不合并旧的 `/etc/cfddns.env`
+- daemon / `-once` 的配置合并：defaults → `/etc/cfddns.env` → 进程环境变量 → CLI；某一层"设置了但为空"也算设置，会清掉下层的值（`CFDDNS_PORT=` 等于关掉 HTTP）
+- `-install` 只认进程环境变量 + CLI，不合并旧的 `/etc/cfddns.env`；`-uninstall` 什么配置都不读
+- 命令行只接受 flag，多出来的位置参数直接报错（`flag` 解析遇到第一个非 flag 就停，后面的 `-once` 会被静默丢掉，所以不允许）
 - `/etc/cfddns.env` 的值是裸 `KEY=value`：可见 ASCII，不含空白、引号、反斜杠、`#`、`;`；`-token` / `-passwd` 要能装进这个格式
 - 缺对应 IP 栈：该族失败并打日志，**daemon 不退出**
 
@@ -160,14 +169,14 @@ cfddns -h
 | 默认 daemon | 启动先更新一次，再按 `-period` 循环；可选 HTTP |
 | `-once` | 更新一轮；全部族成功 exit 0，否则非 0 |
 | `-install` | 装二进制 + env + 服务定义，开机自启并 restart |
-| `-uninstall` | 停服务、取消自启，删服务定义 / env / 二进制 |
+| `-uninstall` | 停服务、取消自启，删服务定义 / env / 二进制；停服务失败则中止不删 |
 
-- **IP 探测**：Cloudflare `cdn-cgi/trace`，强制 v4 / v6 拨号，直连不走代理。`-6-iface` 指定时读 `/proc/net/if_inet6`，取该网卡非临时、非弃用的全局单播地址（手动配置的优先），没有则回退 trace；结果的 `source` 字段说明来源。
-- **DNS 写入**：记录不存在时创建，DNS only（`proxied=false`，TTL auto）；已存在时用 PATCH 只改 `content`，面板上设的 proxied / TTL / comment / tags 原样保留。
-- **缓存**：首次解析后缓存 zone ID 与记录 ID，IP 不变的周期不调 API，IP 变了直接 PATCH；每 12 个周期全量核对一次，面板手改会在核对时被纠正。
-- **同名多条记录**：按 ID 排序只管第一条，其余保持原内容，并在日志和 HTTP 结果里给出 `warning`。
-- **日志**：created / updated / error 每次打；`unchanged` 只在首轮和状态变化后打一次，稳态不刷日志。
-- **HTTP**：`/update` 单次更新 2 分钟超时，连接有读头 / 读 / 空闲超时；更新互斥，等锁超时直接返回 `ok:false`。
+- **IP 探测**：Cloudflare `cdn-cgi/trace`，强制 v4 / v6 拨号，直连不走代理；返回的地址族与请求不符（经 NAT64 / 隧道等）时该族报错，不会把 IPv6 写进 A 记录。`-6-iface` 指定时读 `/proc/net/if_inet6`，取该网卡非临时、非弃用的全局单播地址（手动配置的优先），没有则回退 trace；结果的 `source` 字段说明来源。
+- **DNS 写入**：记录不存在时创建，DNS only（`proxied=false`，TTL auto），创建后复读一次，若另一个 cfddns 进程同时也创建了同名记录则删掉自己刚建的、保留 ID 最小的；已存在时用 PATCH 只改 `content`，面板上设的 proxied / TTL / comment / tags 原样保留。
+- **缓存**：首次解析后缓存 zone ID 与记录 ID，IP 不变的周期不调 API，IP 变了直接 PATCH；每 12 个周期全量核对一次，面板手改会在核对时被纠正。PATCH 返回 404（记录被删或重建）才重新全量解析；限流 / 5xx / 网络错误只报错并保留缓存，下一轮重试那一次 PATCH。
+- **同名多条记录**：按 ID 排序只管第一条，其余保持原内容；每一轮的 HTTP 结果都带 `warning`，日志在 warning 出现和消失时各打一次。
+- **日志**：created / updated 每次打；`unchanged` 和 error 只在状态变化时打（首轮、恢复、错误文本变了）；同一错误持续时每 12 轮再打一次并注明已连续多少轮。稳态不刷日志。
+- **HTTP**：`/update` 单次更新 2 分钟超时，连接有读头 / 读 / 空闲超时；更新互斥，等锁超时直接返回 `ok:false`。`Authorization` 的 `Bearer` 不区分大小写。
 - **内存**：GOMAXPROCS=1；每轮结束关闭空闲连接并把堆页归还 OS；API 客户端只用 HTTP/1.1。见[内存](#内存)。
 
 ---
@@ -209,7 +218,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="-s -w" -o cfddns-
 CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -ldflags="-s -w" -o cfddns-linux-mipsle ./cmd/cfddns
 ```
 
-CI：push `main` 跑 gofmt / vet / staticcheck / `go test -race` 并构建六个架构的 Artifact；推送 tag `v*` 发布 Release（六个二进制 + `SHA256SUMS`）。
+CI：push `main` 跑 gofmt / vet / staticcheck / `go test -race` 并构建六个架构的 Artifact；推送 tag `v*` 复用同一套检查与构建后发布 Release（六个二进制 + `SHA256SUMS`）。手动触发 Release 并填入 tag 时，检出并构建的是那个 tag 的源码，与从哪个分支触发无关。
 
 ```sh
 git tag v0.2.0 && git push origin v0.2.0

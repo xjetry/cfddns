@@ -217,3 +217,25 @@ func TestFamily_String(t *testing.T) {
 		t.Fatalf("IPv6: %q", ip.IPv6.String())
 	}
 }
+
+// A record of one family must never receive an address of the other: the
+// dial is forced to the family, but the answer is checked too, so a tunnel
+// or translator that makes the server see the other family fails here
+// instead of as a Cloudflare validation error every cycle.
+func TestDetector_TraceAnswerMustMatchFamily(t *testing.T) {
+	cases := []struct {
+		body string
+		f    ip.Family
+	}{
+		{"ip=2001:db8::1\n", ip.IPv4},
+		{"ip=203.0.113.9\n", ip.IPv6},
+		{"ip=::ffff:203.0.113.9\n", ip.IPv6},
+	}
+	for _, c := range cases {
+		d := &ip.Detector{ClientFor: traceServer(t, c.body)}
+		_, err := d.Detect(context.Background(), c.f)
+		if err == nil || !strings.Contains(err.Error(), "not an "+c.f.String()+" address") {
+			t.Errorf("%s for %s: err = %v", strings.TrimSpace(c.body), c.f, err)
+		}
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,19 @@ func (f Family) String() string {
 		return "ipv6"
 	}
 	return "ipv4"
+}
+
+// matches reports whether addr is an address of this family. An IPv4-mapped
+// IPv6 address is IPv4 content, not something an AAAA record may hold.
+func (f Family) matches(addr string) bool {
+	a, err := netip.ParseAddr(addr)
+	if err != nil {
+		return false
+	}
+	if f == IPv6 {
+		return a.Is6() && !a.Is4In6()
+	}
+	return a.Is4()
 }
 
 // Detection is a detected public address and where it came from.
@@ -173,5 +187,15 @@ func (d *Detector) trace(ctx context.Context, f Family) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return ParseTraceIP(string(b))
+	addr, err := ParseTraceIP(string(b))
+	if err != nil {
+		return "", err
+	}
+	// The dial was forced to f, but a translator or tunnel on the path can
+	// make the server see the other family; an A record must never receive
+	// IPv6 content (Cloudflare would reject it every cycle).
+	if !f.matches(addr) {
+		return "", fmt.Errorf("trace %s: answer %s is not an %s address", f, addr, f)
+	}
+	return addr, nil
 }

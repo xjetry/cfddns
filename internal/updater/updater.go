@@ -55,16 +55,20 @@ type DNS interface {
 	FindRecords(ctx context.Context, zoneID, typ, name string) ([]cloudflare.Record, error)
 	CreateRecord(ctx context.Context, zoneID, typ, name, content string) (cloudflare.Record, error)
 	UpdateRecordContent(ctx context.Context, zoneID, recordID, content string) error
+	DeleteRecord(ctx context.Context, zoneID, recordID string) error
 }
 
 // familyCache is what a full resolve learned about one family's record.
 // content is the value Cloudflare holds as far as this process knows (last
 // read or last successfully pushed); served counts cycles answered from the
-// cache since that resolve.
+// cache since that resolve. warning is the duplicate-record warning that
+// resolve produced: a cached cycle repeats it, so every cycle's result (log
+// line or HTTP body) states the condition, not only one in RecheckEvery.
 type familyCache struct {
 	zoneID   string
 	recordID string
 	content  string
+	warning  string
 	served   int
 }
 
@@ -76,6 +80,12 @@ type Updater struct {
 	DomainV6 string
 	IP       IPDetector
 	DNS      DNS
+	// Observe, when set, receives every cycle's results while the cycle
+	// still holds the lock, so an observer sees cycles in the order they ran
+	// and never two at once; a stateful observer (the log reporter) needs no
+	// lock of its own for that reason. A Run that gave up waiting for the
+	// lock ran no cycle and is not observed: its results go to its caller.
+	Observe func(results []Result)
 
 	initOnce sync.Once
 	sem      chan struct{}
@@ -131,6 +141,9 @@ func (u *Updater) Run(ctx context.Context) (results []Result, allOK bool) {
 			allOK = false
 		}
 	}
+	if u.Observe != nil {
+		u.Observe(results)
+	}
 	return results, allOK
 }
 
@@ -144,12 +157,14 @@ func (u *Updater) runFamily(ctx context.Context, fs familySpec) Result {
 	res.IP, res.Source = det.Addr, det.Source
 
 	if c := u.cache[fs.f]; c != nil && c.served < RecheckEvery {
+		res.Warning = c.warning
 		if c.content == det.Addr {
 			c.served++
 			res.Action = ActionUnchanged
 			return res
 		}
-		if err := u.DNS.UpdateRecordContent(ctx, c.zoneID, c.recordID, det.Addr); err == nil {
+		err := u.DNS.UpdateRecordContent(ctx, c.zoneID, c.recordID, det.Addr)
+		if err == nil {
 			// A successful PATCH proves the cached IDs are still valid, so it
 			// counts as a verification.
 			c.content = det.Addr
@@ -157,8 +172,15 @@ func (u *Updater) runFamily(ctx context.Context, fs familySpec) Result {
 			res.Action = ActionUpdated
 			return res
 		}
-		// The cached IDs may be stale (record deleted or recreated); resolve
-		// from scratch instead of reporting an error the resolve may fix.
+		if !cloudflare.IsNotFound(err) {
+			// Rate limit, outage, auth: nothing says the record is gone, so
+			// the IDs stay and the next cycle retries the one PATCH. A
+			// resolve here would spend three more calls on an API that is
+			// already refusing.
+			return res.fail(err)
+		}
+		// The cached record no longer exists (deleted or recreated in the
+		// dashboard); resolve from scratch, which may create it again.
 	}
 	return u.resolve(ctx, res, fs, det.Addr)
 }
@@ -178,33 +200,84 @@ func (u *Updater) resolve(ctx context.Context, res Result, fs familySpec, addr s
 		return res.fail(err)
 	}
 
+	createdID := ""
 	if len(records) == 0 {
 		rec, err := u.DNS.CreateRecord(ctx, zoneID, fs.recType, fs.domain, addr)
 		if err != nil {
 			return res.fail(err)
 		}
-		u.cache[fs.f] = &familyCache{zoneID: zoneID, recordID: rec.ID, content: addr}
-		res.Action = ActionCreated
-		return res
+		createdID = rec.ID
+		records, res.Warning = u.afterCreate(ctx, zoneID, fs, rec)
 	}
 
 	// API order is unspecified; sort by ID so the managed record is the same
 	// one on every recheck instead of drifting between siblings.
 	sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
 	rec := records[0]
-	if len(records) > 1 {
+	if len(records) > 1 && res.Warning == "" {
 		res.Warning = fmt.Sprintf("%d %s records named %s; only %s is managed, the other %d keep their content",
 			len(records), fs.recType, fs.domain, rec.ID, len(records)-1)
 	}
 
-	if rec.Content == addr {
+	switch {
+	case rec.ID == createdID:
+		res.Action = ActionCreated
+	case rec.Content == addr:
 		res.Action = ActionUnchanged
-	} else {
+	default:
 		if err := u.DNS.UpdateRecordContent(ctx, zoneID, rec.ID, addr); err != nil {
 			return res.fail(err)
 		}
 		res.Action = ActionUpdated
 	}
-	u.cache[fs.f] = &familyCache{zoneID: zoneID, recordID: rec.ID, content: addr}
+	u.cache[fs.f] = &familyCache{zoneID: zoneID, recordID: rec.ID, content: addr, warning: res.Warning}
 	return res
+}
+
+// afterCreate re-reads the name right after a POST and deletes the record
+// this process just made when a lower ID exists. Cloudflare accepts several
+// A/AAAA records of one name, and two cfddns processes (the service's first
+// cycle beside a manual -once, cron beside a daemon) can both pass
+// FindRecords before either POSTs; without this step both records would stay
+// forever. Every racer applies the same rule, so all of them converge on the
+// lowest ID without knowing of each other, and only the record this process
+// created is ever deleted, because nothing else is known to be ours.
+//
+// The returned set is what the name holds now; the created record is always
+// in it unless it was deleted here, even when the read lagged the write. A
+// non-empty warning says what could not be checked or undone; the caller
+// reports it in place of the generic duplicate warning.
+func (u *Updater) afterCreate(ctx context.Context, zoneID string, fs familySpec, created cloudflare.Record) ([]cloudflare.Record, string) {
+	records, err := u.DNS.FindRecords(ctx, zoneID, fs.recType, fs.domain)
+	if err != nil {
+		return []cloudflare.Record{created}, fmt.Sprintf("created %s but could not re-read %s records to rule out a duplicate from a concurrent run: %v",
+			created.ID, fs.recType, err)
+	}
+	lowest := created.ID
+	seen := false
+	for _, r := range records {
+		if r.ID == created.ID {
+			seen = true
+		}
+		if r.ID < lowest {
+			lowest = r.ID
+		}
+	}
+	if !seen {
+		records = append(records, created)
+	}
+	if lowest == created.ID {
+		return records, ""
+	}
+	if err := u.DNS.DeleteRecord(ctx, zoneID, created.ID); err != nil {
+		return records, fmt.Sprintf("created %s beside existing %s and could not delete the duplicate: %v; only %s is managed",
+			created.ID, lowest, err, lowest)
+	}
+	kept := make([]cloudflare.Record, 0, len(records)-1)
+	for _, r := range records {
+		if r.ID != created.ID {
+			kept = append(kept, r)
+		}
+	}
+	return kept, ""
 }
