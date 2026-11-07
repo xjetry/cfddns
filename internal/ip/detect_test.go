@@ -3,6 +3,7 @@ package ip_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -104,6 +105,45 @@ func TestDetector_Detect_TraceErrors(t *testing.T) {
 	_, err := d.Detect(context.Background(), ip.IPv6)
 	if err == nil || !strings.Contains(err.Error(), "no route to host") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// 1.1.1.1 is blocked on some networks; www.cloudflare.com must be asked next.
+func TestDetector_Detect_FallsBackToWWW(t *testing.T) {
+	cases := []struct {
+		f    ip.Family
+		addr string
+		want []string
+	}{
+		{ip.IPv4, "203.0.113.20", []string{"https://1.1.1.1/cdn-cgi/trace", "https://www.cloudflare.com/cdn-cgi/trace"}},
+		{ip.IPv6, "2001:db8::20", []string{"https://[2606:4700:4700::1111]/cdn-cgi/trace", "https://www.cloudflare.com/cdn-cgi/trace"}},
+	}
+	for _, c := range cases {
+		t.Run(c.f.String(), func(t *testing.T) {
+			var asked []string
+			d := &ip.Detector{ClientFor: func(f ip.Family) *http.Client {
+				if f != c.f {
+					t.Errorf("client for %v, want %v", f, c.f)
+				}
+				return &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					asked = append(asked, req.URL.String())
+					if req.URL.Host != "www.cloudflare.com" {
+						return nil, errors.New("i/o timeout")
+					}
+					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ip=" + c.addr + "\n")), Request: req}, nil
+				})}
+			}}
+			got, err := d.Detect(context.Background(), c.f)
+			if err != nil {
+				t.Fatalf("Detect: %v", err)
+			}
+			if got.Addr != c.addr || got.Source != "trace" {
+				t.Fatalf("got %+v", got)
+			}
+			if strings.Join(asked, " ") != strings.Join(c.want, " ") {
+				t.Fatalf("asked %q, want %q", asked, c.want)
+			}
+		})
 	}
 }
 

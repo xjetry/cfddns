@@ -47,7 +47,7 @@ wget -qO- https://raw.githubusercontent.com/xjetry/cfddns/main/install.sh \
   | sh -s -- -4 home.example.com -token 'YOUR_CF_TOKEN' -port 8080 -passwd 'YOUR_HTTP_SECRET'
 ```
 
-`install.sh` 认两个环境变量：`CFDDNS_VERSION=v0.3.0` 装指定版本，`CFDDNS_ASSET=mipsle` 强制产物。
+`install.sh` 认两个环境变量：`CFDDNS_VERSION=v0.3.1` 装指定版本，`CFDDNS_ASSET=mipsle` 强制产物。
 
 ### 手动下载
 
@@ -176,7 +176,7 @@ cfddns -h
 | `-install` | 装二进制 + env + 服务定义，开机自启并 restart |
 | `-uninstall` | 停服务、取消自启，删服务定义 / env / 二进制 |
 
-- **IP 探测**：Cloudflare `cdn-cgi/trace`，强制 v4 / v6 拨号，直连不走代理。`-6-iface` 指定时读 `/proc/net/if_inet6`，取该网卡非临时、非弃用的全局单播地址（手动配置的优先），没有则回退 trace；结果的 `source` 字段说明来源。
+- **IP 探测**：Cloudflare `cdn-cgi/trace`，先试 `1.1.1.1`（v6 为 `2606:4700:4700::1111`），不通再试 `www.cloudflare.com`；都强制 v4 / v6 拨号，直连不走代理；记住上次成功的端点，下轮先试它。`-6-iface` 指定时读 `/proc/net/if_inet6`，取该网卡非临时、非弃用的全局单播地址（手动配置的优先），没有则回退 trace；结果的 `source` 字段说明来源。
 - **DNS 写入**：记录不存在时创建，DNS only（`proxied=false`，TTL auto）；已存在时用 PATCH 只改 `content`，面板上设的 proxied / TTL / comment / tags 原样保留。
 - **缓存**：首次解析后缓存 zone ID 与记录 ID，IP 不变的周期不调 API，IP 变了直接 PATCH；每 12 个周期全量核对一次，面板手改会在核对时被纠正。
 - **同名多条记录**：按 ID 排序只管第一条，其余保持原内容，并在日志、HTTP 结果、状态文件和 `-inspect` 输出里给出 `warning`。
@@ -291,5 +291,5 @@ CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -ldflags="-s -w
 CI：push `main` 跑 gofmt / vet / staticcheck / `go test -race` 并构建六个架构的 Artifact；推送 tag `v*` 发布 Release（六个二进制 + `SHA256SUMS`）。
 
 ```sh
-git tag v0.3.0 && git push origin v0.3.0
+git tag v0.3.1 && git push origin v0.3.1
 ```
