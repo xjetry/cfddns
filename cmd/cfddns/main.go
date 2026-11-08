@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -19,8 +21,10 @@ import (
 	"cfddns/internal/cloudflare"
 	"cfddns/internal/config"
 	"cfddns/internal/httpserver"
+	"cfddns/internal/inspector"
 	"cfddns/internal/install"
 	"cfddns/internal/ip"
+	"cfddns/internal/status"
 	"cfddns/internal/updater"
 )
 
@@ -83,8 +87,22 @@ func main() {
 		log.Fatal(err)
 	}
 
-	det := &ip.Detector{V6Iface: cfg.V6Iface}
 	dns := &cloudflare.Client{Token: cfg.Token}
+	if cfg.Inspect {
+		insp := inspector.Inspector{
+			DomainV4: cfg.DomainV4,
+			DomainV6: cfg.DomainV6,
+			DNS:      dns,
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := runInspect(ctx, &insp, os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	det := &ip.Detector{V6Iface: cfg.V6Iface}
 	rep := newReporter(log.Printf)
 	up := &updater.Updater{
 		DomainV4: cfg.DomainV4,
@@ -96,9 +114,39 @@ func main() {
 		// cycle lock, which is what makes that safe.
 		Observe: rep.report,
 	}
+	var statusRep *status.Reporter
+	if cfg.StatusFile != "" {
+		statusRep = status.New(status.Config{
+			Path:     cfg.StatusFile,
+			Period:   cfg.Period,
+			DomainV4: cfg.DomainV4,
+			DomainV6: cfg.DomainV6,
+		})
+		if err := statusRep.Clear(); err != nil {
+			log.Printf("status clear failed: %v", err)
+		}
+	}
+	runOnce := func(ctx context.Context) ([]updater.Result, bool) {
+		results, ok := up.Run(ctx)
+		// Unlike the log reporter, status also records a lock-wait failure:
+		// no detection ran, but the attempted execution belongs in the snapshot.
+		reportStatus(statusRep, results, log.Printf)
+		return results, ok
+	}
 
 	if cfg.Once {
-		os.Exit(once(up))
+		_, ok := runOnce(context.Background())
+		if !ok {
+			os.Exit(1)
+		}
+		return
+	}
+	if statusRep != nil {
+		defer func() {
+			if err := statusRep.Clear(); err != nil {
+				log.Printf("status clear failed: %v", err)
+			}
+		}()
 	}
 
 	// Between cycles the daemon only waits, so everything a cycle allocated
@@ -107,7 +155,7 @@ func main() {
 	// OS right away keeps the resident size at the idle minimum on routers
 	// and other small hosts instead of waiting for the lazy scavenger.
 	cycle := func(ctx context.Context) ([]updater.Result, bool) {
-		results, ok := up.Run(ctx)
+		results, ok := runOnce(ctx)
 		det.CloseIdleConnections()
 		dns.CloseIdleConnections()
 		debug.FreeOSMemory()
@@ -193,5 +241,24 @@ func (d *daemon) run(ctx context.Context) {
 		case <-t.C:
 			d.cycle(ctx)
 		}
+	}
+}
+
+// runInspect writes the {ok,results} envelope; failed family queries are
+// reported inside it, so only an encoding or write failure is returned.
+func runInspect(ctx context.Context, insp *inspector.Inspector, w io.Writer) error {
+	results, ok := insp.Inspect(ctx)
+	return json.NewEncoder(w).Encode(struct {
+		OK      bool               `json:"ok"`
+		Results []inspector.Result `json:"results"`
+	}{OK: ok, Results: results})
+}
+
+func reportStatus(rep *status.Reporter, results []updater.Result, logf func(string, ...any)) {
+	if rep == nil {
+		return
+	}
+	if err := rep.Report(results); err != nil {
+		logf("status report failed: %v", err)
 	}
 }

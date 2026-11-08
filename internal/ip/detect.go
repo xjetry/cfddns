@@ -2,13 +2,16 @@ package ip
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,19 +27,6 @@ func (f Family) String() string {
 		return "ipv6"
 	}
 	return "ipv4"
-}
-
-// matches reports whether addr is an address of this family. An IPv4-mapped
-// IPv6 address is IPv4 content, not something an AAAA record may hold.
-func (f Family) matches(addr string) bool {
-	a, err := netip.ParseAddr(addr)
-	if err != nil {
-		return false
-	}
-	if f == IPv6 {
-		return a.Is6() && !a.Is4In6()
-	}
-	return a.Is4()
 }
 
 // Detection is a detected public address and where it came from.
@@ -65,6 +55,14 @@ func ParseTraceIP(body string) (string, error) {
 	return "", fmt.Errorf("ip= not found in trace")
 }
 
+// defaultTraceURLs lists each family's trace endpoints in the order they are
+// tried. 1.1.1.1 is unreachable on some networks; www.cloudflare.com serves
+// the same trace, and the family's forced dial keeps the answer in-family.
+var defaultTraceURLs = [2][]string{
+	IPv4: {"https://1.1.1.1/cdn-cgi/trace", "https://www.cloudflare.com/cdn-cgi/trace"},
+	IPv6: {"https://[2606:4700:4700::1111]/cdn-cgi/trace", "https://www.cloudflare.com/cdn-cgi/trace"},
+}
+
 // Detector fetches the public IP via Cloudflare trace with a forced address
 // family, optionally preferring a stable interface address for IPv6.
 type Detector struct {
@@ -76,9 +74,14 @@ type Detector struct {
 	ProcIfInet6 string
 	// ClientFor optional override for tests: func(Family) *http.Client
 	ClientFor func(Family) *http.Client
+	// traceURLs overrides defaultTraceURLs per family (tests).
+	traceURLs [2][]string
 
 	once    sync.Once
 	clients [2]*http.Client
+	// lastTrace is the index of the trace endpoint that last answered, per
+	// family; it is asked first next time.
+	lastTrace [2]atomic.Int32
 }
 
 // client returns the long-lived client for f. One Transport per family is
@@ -138,6 +141,13 @@ func (d *Detector) newClient(f Family) *http.Client {
 	return &http.Client{Timeout: timeout, Transport: tr}
 }
 
+func (d *Detector) traceEndpoints(f Family) []string {
+	if len(d.traceURLs[f]) > 0 {
+		return d.traceURLs[f]
+	}
+	return defaultTraceURLs[f]
+}
+
 func (d *Detector) procPath() string {
 	if d.ProcIfInet6 != "" {
 		return d.ProcIfInet6
@@ -165,23 +175,57 @@ func (d *Detector) Detect(ctx context.Context, f Family) (Detection, error) {
 	return Detection{Addr: addr, Source: source}, nil
 }
 
+// trace asks the trace endpoints of f in turn, starting with the one that
+// answered last time, and stops at the first in-family answer or once ctx is
+// done. The error names every endpoint asked and why it failed.
 func (d *Detector) trace(ctx context.Context, f Family) (string, error) {
-	url := "https://1.1.1.1/cdn-cgi/trace"
-	if f == IPv6 {
-		url = "https://[2606:4700:4700::1111]/cdn-cgi/trace"
+	urls := d.traceEndpoints(f)
+	first := int(d.lastTrace[f].Load())
+	if first >= len(urls) {
+		first = 0
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	order := []int{first}
+	for i := range urls {
+		if i != first {
+			order = append(order, i)
+		}
+	}
+	var errs []string
+	for _, i := range order {
+		if ctx.Err() != nil {
+			break
+		}
+		addr, err := d.traceURL(ctx, f, urls[i])
+		if err == nil {
+			d.lastTrace[f].Store(int32(i))
+			return addr, nil
+		}
+		errs = append(errs, fmt.Sprintf("%s: %v", urls[i], err))
+	}
+	if len(errs) == 0 {
+		return "", fmt.Errorf("trace %s: %w", f, ctx.Err())
+	}
+	return "", fmt.Errorf("trace %s: %s", f, strings.Join(errs, "; "))
+}
+
+func (d *Detector) traceURL(ctx context.Context, f Family, endpoint string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return "", err
 	}
 	resp, err := d.client(f).Do(req)
 	if err != nil {
 		// Missing stack / no route surfaces here — caller treats as soft error.
-		return "", fmt.Errorf("trace %s: %w", f, err)
+		// trace already names the endpoint, so drop the URL wrapper.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			return "", ue.Err
+		}
+		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("trace %s: status %d", f, resp.StatusCode)
+		return "", fmt.Errorf("status %d", resp.StatusCode)
 	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
@@ -194,8 +238,21 @@ func (d *Detector) trace(ctx context.Context, f Family) (string, error) {
 	// The dial was forced to f, but a translator or tunnel on the path can
 	// make the server see the other family; an A record must never receive
 	// IPv6 content (Cloudflare would reject it every cycle).
-	if !f.matches(addr) {
-		return "", fmt.Errorf("trace %s: answer %s is not an %s address", f, addr, f)
+	if err := checkFamily(addr, f); err != nil {
+		return "", err
 	}
 	return addr, nil
+}
+
+// checkFamily rejects a trace answer outside f: IPv4 must be a 4-byte
+// address, IPv6 must be neither IPv4 nor IPv4-mapped.
+func checkFamily(addr string, f Family) error {
+	a, err := netip.ParseAddr(addr)
+	if err != nil {
+		return err
+	}
+	if f == IPv4 && a.Is4() || f == IPv6 && a.Is6() && !a.Is4In6() {
+		return nil
+	}
+	return fmt.Errorf("answer %s is not an %s address", addr, f)
 }
